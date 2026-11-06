@@ -216,16 +216,49 @@ export class Gateway extends DurableObject<Env> {
 
     // Authenticate the access token. The digest is SHA-256 over the raw token,
     // matching the reference implementation.
+    //
+    // Each rejection logs why, with the device id but never the token. Without this,
+    // a client reporting only "AUTH_INVALID" leaves no way to tell an unregistered
+    // device from a role mismatch from an expired token — and those need completely
+    // different fixes.
     const digest = await sha256Hex(hello.accessToken)
     const token = this.store.findToken(digest)
-    if (token === null || token.kind !== 'access') { this.fail(ws, 'AUTH_INVALID'); return }
-    if (token.expires_at <= Date.now()) { this.fail(ws, 'TOKEN_EXPIRED'); return }
-    if (token.device_id !== hello.deviceId) { this.fail(ws, 'AUTH_INVALID'); return }
+    if (token === null || token.kind !== 'access') {
+      console.warn('hello rejected: token not found', { deviceId: hello.deviceId, role: hello.role, kind: token?.kind })
+      this.fail(ws, 'AUTH_INVALID')
+      return
+    }
+    if (token.expires_at <= Date.now()) {
+      console.warn('hello rejected: token expired', { deviceId: hello.deviceId })
+      this.fail(ws, 'TOKEN_EXPIRED')
+      return
+    }
+    if (token.device_id !== hello.deviceId) {
+      console.warn('hello rejected: token belongs to another device', {
+        helloDeviceId: hello.deviceId, tokenDeviceId: token.device_id,
+      })
+      this.fail(ws, 'AUTH_INVALID')
+      return
+    }
 
     const device = this.store.getDevice(hello.deviceId)
-    if (device === null) { this.fail(ws, 'AUTH_INVALID'); return }
-    if (device.revoked !== 0) { this.fail(ws, 'DEVICE_REVOKED'); return }
-    if (device.role !== hello.role) { this.fail(ws, 'AUTH_INVALID'); return }
+    if (device === null) {
+      console.warn('hello rejected: device not registered', { deviceId: hello.deviceId, role: hello.role })
+      this.fail(ws, 'AUTH_INVALID')
+      return
+    }
+    if (device.revoked !== 0) {
+      console.warn('hello rejected: device revoked', { deviceId: hello.deviceId })
+      this.fail(ws, 'DEVICE_REVOKED')
+      return
+    }
+    if (device.role !== hello.role) {
+      console.warn('hello rejected: role mismatch', {
+        deviceId: hello.deviceId, helloRole: hello.role, registeredRole: device.role,
+      })
+      this.fail(ws, 'AUTH_INVALID')
+      return
+    }
 
     // The hello may have raced the deadline; if the state moved on, drop it.
     if (attachment.state !== 'awaiting_hello') return
@@ -702,9 +735,16 @@ export class Gateway extends DurableObject<Env> {
     } catch (error) { return fromThrown(error) }
   }
 
+  /**
+   * All active devices.
+   *
+   * `identityKey` is included here and filtered per endpoint by the Worker: the
+   * single-peer response needs it (the client validates and pins it), the list
+   * response must not carry it.
+   */
   async listDevices(): Promise<Array<{
     deviceId: string; role: string; name: string; platform: string; clientVersion: string
-    harnessVersion: string | null; lastSeenAt: number; online: boolean
+    identityKey: string; harnessVersion: string | null; lastSeenAt: number; online: boolean
   }>> {
     return this.store.listDevices().map(device => ({
       deviceId: device.device_id,
@@ -712,6 +752,7 @@ export class Gateway extends DurableObject<Env> {
       name: device.name,
       platform: device.platform,
       clientVersion: device.client_version,
+      identityKey: device.identity_key,
       harnessVersion: device.harness_version,
       lastSeenAt: device.last_seen_at,
       online: this.peers.has(device.device_id),

@@ -34,7 +34,7 @@ interface AuthenticatedDevice {
 }
 interface DeviceSummary {
   deviceId: string; role: string; name: string; platform: string; clientVersion: string
-  harnessVersion: string | null; lastSeenAt: number; online: boolean
+  identityKey: string; harnessVersion: string | null; lastSeenAt: number; online: boolean
 }
 interface LockoutState { locked: boolean; retryAfterMs: number }
 
@@ -348,7 +348,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
   if (method === 'GET' && path === '/api/v1/me') {
     const device = await requireDevice(request, env)
-    return Response.json(descriptor(device))
+    return Response.json(descriptor(device, env))
   }
 
   if (method === 'GET' && path === '/api/v1/account/devices') {
@@ -378,17 +378,14 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     return Response.json({
       items: devices
         .filter(entry => entry.role === 'host')
-        .map(entry => ({
-          deviceId: entry.deviceId,
-          name: entry.name,
-          role: entry.role,
-          platform: entry.platform,
-          clientVersion: entry.clientVersion,
-          harnessVersion: entry.harnessVersion,
-          online: entry.online,
-          lastSeenAt: entry.lastSeenAt,
-          membershipId: membershipId(env),
-        })),
+        // `identityKey` is deliberately stripped from list responses, matching the
+        // reference server: the client pins a peer's key when it first connects to
+        // that peer, and a key taken from a list would let the server substitute one
+        // without the client noticing. Only the single-peer endpoint carries it.
+        .map(entry => {
+          const { identityKey: _identityKey, ...rest } = descriptor(entry, env)
+          return rest
+        }),
       nextCursor: null,
     })
   }
@@ -413,7 +410,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     await callGateway<void>(env, 'renameDevice', [renameMatch[1]!, name])
     const device = await callGateway<DeviceSummary | null>(env, 'getDevice', [renameMatch[1]!])
     if (device === null) throw new ApiError('DEVICE_NOT_FOUND', 404)
-    return Response.json(descriptor(device))
+    return Response.json(descriptor(device, env))
   }
 
   const deviceMatch = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)
@@ -425,7 +422,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     // makes the second case impossible today, but the shape must not regress.)
     if (target === null) throw new ApiError('DEVICE_NOT_FOUND', 404)
     if (source.role === target.role) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
-    const full = descriptor(target)
+    const full = descriptor(target, env)
     return Response.json(deviceMatch[2] !== undefined
       ? { deviceId: full.deviceId, online: full.online, lastSeenAt: full.lastSeenAt }
       : full)
@@ -567,15 +564,27 @@ async function registerDevice(
   return Response.json(issued.value)
 }
 
+/**
+ * Device descriptor returned by the peer and self endpoints.
+ *
+ * `identityKey` and `membershipId` are not optional: the client validates every peer
+ * record against them and rejects the whole response with "invalid authorized peer
+ * data" when either is missing. `identityKey` is also what the client pins per peer,
+ * so omitting it does not just break parsing — it removes the guarantee that a peer's
+ * key cannot change silently.
+ */
 function descriptor(device: {
   deviceId: string; role: string; name: string; platform: string; clientVersion: string
+  identityKey: string
   harnessVersion?: string | null; online?: boolean; lastSeenAt?: number
-}): Record<string, unknown> {
+}, env: Env): Record<string, unknown> {
   return {
     deviceId: device.deviceId,
     name: device.name,
     role: device.role,
     platform: device.platform,
+    identityKey: device.identityKey,
+    membershipId: membershipId(env),
     clientVersion: device.clientVersion,
     ...(device.harnessVersion != null ? { harnessVersion: device.harnessVersion } : {}),
     ...(device.online !== undefined ? { online: device.online } : {}),
