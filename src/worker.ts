@@ -346,6 +346,23 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     return Response.json({ status: 'revoked' })
   }
 
+  // Revoke any device of this account.
+  //
+  // The reference server has no such endpoint — a device can only revoke itself, and
+  // the account holder has no way to remove a device they no longer control. That is a
+  // real gap for an operator: a lost phone stays in the list forever and keeps a valid
+  // refresh token. This is account-scoped (`/account/`, session-authenticated) rather
+  // than device-scoped, so a device token cannot revoke its peers.
+  const revokeMatch = /^\/api\/v1\/account\/devices\/([^/]+)$/.exec(path)
+  if (method === 'DELETE' && revokeMatch !== null) {
+    await requireSession(request, env)
+    const target = decodeURIComponent(revokeMatch[1]!)
+    const existing = await callGateway<DeviceSummary | null>(env, 'getDevice', [target])
+    if (existing === null) throw new ApiError('DEVICE_NOT_FOUND', 404)
+    await callGateway<void>(env, 'revokeDevice', [target])
+    return Response.json({ status: 'revoked', deviceId: target })
+  }
+
   if (method === 'GET' && path === '/api/v1/me') {
     const device = await requireDevice(request, env)
     return Response.json(descriptor(device, env))
