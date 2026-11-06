@@ -14,6 +14,8 @@ export interface Env {
   readonly DSH_SERVER_PASSWORD: string
   /** Public origin, used for Origin validation. No trailing slash, no path. */
   readonly DSH_SERVER_PUBLIC_URL: string
+  /** `assets` serves the SPA at `/`; anything else answers 418 at the root. */
+  readonly DSH_SERVER_ROOT_PAGE?: string
   /** Signs web session cookies. A secret, at least 16 characters. */
   readonly SESSION_SECRET: string
 

@@ -49,8 +49,17 @@ export async function verifyCredentials(env: Env, email: string, password: strin
   return { ok: true, account: configuredAccount }
 }
 
-/** Minimum password length the reference server enforces at startup. */
-export const MIN_PASSWORD_LENGTH = 12
+/**
+ * Minimum password length accepted at startup.
+ *
+ * Lower than the reference server's 12 because this is a single-operator
+ * deployment where the password is chosen by the person who owns the account, and a
+ * hard 12-character floor would reject a legitimate short secret outright. The
+ * defence that actually matters here is the lockout and the rate limits, both of
+ * which are independent of length. Set it higher if the password is reused
+ * anywhere; this floor only stops an obviously trivial one.
+ */
+export const MIN_PASSWORD_LENGTH = 8
 
 /** Fail fast and loudly when the deployment is not usable. */
 export function assertConfigured(env: Env): void {

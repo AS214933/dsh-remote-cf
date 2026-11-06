@@ -80,10 +80,42 @@ export default {
       }
     }
 
-    // Static assets (the SPA) with single-page-application fallback.
-    return env.ASSETS.fetch(request)
+    // Everything else answers 418 by default.
+    //
+    // This deployment has no public web UI: the clients talk to /api/* and
+    // /ws/v1/connect, and nothing else is meant to be reachable. Returning a
+    // teapot instead of a page means a scanner probing for an admin panel, a
+    // .env, or a WordPress install gets the same boring answer as a real
+    // visitor, and learns that this origin is not a website. It also stops the
+    // static-asset handler from turning every unknown path into a 200 SPA shell,
+    // which previously made the server look like it had a UI it does not have.
+    //
+    // Set DSH_SERVER_ROOT_PAGE=assets to serve the SPA at / instead (for a
+    // deployment that does ship a UI).
+    if (url.pathname === '/' && env.DSH_SERVER_ROOT_PAGE === 'assets') {
+      return env.ASSETS.fetch(request)
+    }
+    return teapot()
   },
 } satisfies ExportedHandler<Env>
+
+/**
+ * 418 I'm a teapot.
+ *
+ * `Content-Type: text/plain` and a fixed body on purpose: no HTML, no asset
+ * references, nothing that hints at a stack, and nothing a crawler will index.
+ */
+function teapot(): Response {
+  return new Response("I'm a teapot\n", {
+    status: 418,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      // Tell well-behaved crawlers and scanners not to come back.
+      'X-Robots-Tag': 'noindex, nofollow',
+      'Cache-Control': 'public, max-age=3600',
+    },
+  })
+}
 
 // ---------------------------------------------------------------------------
 // errors

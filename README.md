@@ -50,7 +50,7 @@ npm install
 
 # Required secrets — never as plain vars, which are readable in the dashboard.
 npx wrangler secret put SESSION_SECRET          # >= 16 chars, signs session cookies
-npx wrangler secret put DSH_SERVER_PASSWORD     # >= 12 chars
+npx wrangler secret put DSH_SERVER_PASSWORD     # >= 8 chars
 
 # Edit wrangler.jsonc for your account and public URL, then:
 npx wrangler deploy
@@ -62,6 +62,7 @@ npx wrangler deploy
 | --- | --- |
 | `DSH_SERVER_ACCOUNT` | The one account, e.g. your email |
 | `DSH_SERVER_PUBLIC_URL` | Public origin; must match the browser origin exactly |
+| `DSH_SERVER_ROOT_PAGE` | `assets` serves the SPA at `/`; default answers 418 |
 | `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` | Optional, for Cloudflare Realtime TURN |
 | `DSH_SERVER_HEARTBEAT_INTERVAL_MS` | Optional, default 25000, bounded 5000–120000 |
 
@@ -89,6 +90,8 @@ config is `wrangler.jsonc`.
 | `test/data-plane.mjs` | **A real Noise IK tunnel** through the server's relay |
 | `test/webrtc-path.mjs` | **A real WebRTC data channel** negotiated through the server |
 | `test/turn-relay.mjs` | **TURN forced** (`iceTransportPolicy: relay`) so relaying is proven |
+
+中文文档见 [README-zh.md](README-zh.md).
 
 `e2e.mjs` runs against a live `wrangler dev`, not mocks — the point is to verify the
 SQLite store, the alarm beat and the gateway together under the real runtime.
