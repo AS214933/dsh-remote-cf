@@ -295,6 +295,15 @@ export class Gateway extends DurableObject<Env> {
 
     if (frame.type === 'connect.request') { this.handleConnectRequest(ws, attachment, frame); return }
 
+    // `connect.accepted` / `connect.rejected` answer a specific connection and carry
+    // only `connectionId` — unlike every other link frame they have no
+    // `targetDeviceId`, because the recipient is implied by who was asked. Handling
+    // them before `parseTarget` is required, not a shortcut.
+    if (frame.type === 'connect.accepted' || frame.type === 'connect.rejected') {
+      this.handleConnectAnswer(attachment, frame)
+      return
+    }
+
     // Everything below is scoped to one existing link.
     const target = parseTarget(frame.payload)
     const link = this.links.get(target.connectionId)
@@ -306,14 +315,6 @@ export class Gateway extends DurableObject<Env> {
     const other = this.peers.get(otherId)
     if (other === undefined) throw new ProtocolError('CONNECTION_FAILED')
     if (target.targetDeviceId !== otherId) throw new ProtocolError('INVALID_MESSAGE')
-
-    if (frame.type === 'connect.accepted' || frame.type === 'connect.rejected') {
-      if (attachment.deviceId !== link.host || link.stage !== 'pending') throw new ProtocolError('INVALID_MESSAGE')
-      if (frame.type === 'connect.rejected') this.links.delete(link.id)
-      else link.stage = 'accepted'
-      this.send(other, frame)
-      return
-    }
 
     if (link.stage === 'pending') throw new ProtocolError('CONNECTION_NOT_FOUND')
 
@@ -349,6 +350,34 @@ export class Gateway extends DurableObject<Env> {
       return
     }
     throw new ProtocolError('INVALID_MESSAGE')
+  }
+
+  /**
+   * Host's answer to a connect.request.
+   *
+   * Only the host may answer, and only while the link is still pending — otherwise
+   * a client could accept its own request, or a stale answer could revive a link the
+   * server already dropped.
+   */
+  private handleConnectAnswer(
+    attachment: Attachment & { deviceId: string; role: 'host' | 'client' },
+    frame: ControlFrame,
+  ): void {
+    const connectionId = frame.payload.connectionId
+    if (typeof connectionId !== 'string' || connectionId === '') throw new ProtocolError('INVALID_MESSAGE')
+    const link = this.links.get(connectionId)
+    if (link === undefined) throw new ProtocolError('CONNECTION_NOT_FOUND')
+    if (attachment.deviceId !== link.host) throw new ProtocolError('INVALID_MESSAGE')
+    if (link.stage !== 'pending') throw new ProtocolError('INVALID_MESSAGE')
+
+    const clientSocket = this.peers.get(link.client)
+    if (frame.type === 'connect.rejected') {
+      this.links.delete(link.id)
+      if (clientSocket !== undefined) this.send(clientSocket, frame)
+      return
+    }
+    link.stage = 'accepted'
+    if (clientSocket !== undefined) this.send(clientSocket, frame)
   }
 
   private handleConnectRequest(

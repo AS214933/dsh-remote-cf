@@ -86,6 +86,7 @@ config is `wrangler.jsonc`.
 | `test/crypto.test.ts` | Digests, session cookie signing/tampering/expiry, timing equalisation, config bounds |
 | `test/e2e.mjs` | Live Worker + Durable Object: login, device lifecycle, token rotation and reuse, WebSocket handshake |
 | `test/host-connect.mjs` | **The real Host plugin client** against a live server |
+| `test/data-plane.mjs` | **A real Noise IK tunnel** through the server's relay |
 
 `e2e.mjs` runs against a live `wrangler dev`, not mocks — the point is to verify the
 SQLite store, the alarm beat and the gateway together under the real runtime.
@@ -102,6 +103,16 @@ DSH_REPO=/path/to/ds-harness-remote npx tsx test/host-connect.mjs   https://your
 It covers: real X25519 identity creation, account login and device registration
 through the shipped API, credential load, the host read paths, the control WebSocket
 hello, and a heartbeat ping/pong round trip.
+
+`data-plane.mjs` goes one layer deeper and is the test that proves the server is
+actually useful: two peers complete a **Noise IK handshake** through the server's
+signaling path, then exchange **encrypted payloads** through it — client to host and
+back, a 256 KiB payload split into Noise-sized chunks, and a deliberately rewound
+relay counter that the server refuses.
+
+```bash
+DSH_REPO=/path/to/ds-harness-remote npx tsx test/data-plane.mjs   https://your-worker owner@example.com 'your-password'
+```
 
 ## Design notes
 
