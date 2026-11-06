@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "dsh-remote-server",
+  "name": "dsh-relay",
+  "account_id": "<your-account-id>",
   "main": "src/worker.ts",
   "compatibility_date": "2026-04-07",
   "compatibility_flags": ["nodejs_compat"],
@@ -14,8 +15,12 @@
     "not_found_handling": "single-page-application"
   },
   "observability": { "enabled": true },
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "dsh-relay.example.workers.dev", "custom_domain": true }
+  ],
   "vars": {
     "DSH_SERVER_ACCOUNT": "owner@example.com",
-    "DSH_SERVER_PUBLIC_URL": "https://dsh-remote-server.example.workers.dev"
+    "DSH_SERVER_PUBLIC_URL": "https://dsh-relay.example.workers.dev"
   }
 }

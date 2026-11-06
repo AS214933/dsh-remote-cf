@@ -87,6 +87,8 @@ config is `wrangler.jsonc`.
 | `test/e2e.mjs` | Live Worker + Durable Object: login, device lifecycle, token rotation and reuse, WebSocket handshake |
 | `test/host-connect.mjs` | **The real Host plugin client** against a live server |
 | `test/data-plane.mjs` | **A real Noise IK tunnel** through the server's relay |
+| `test/webrtc-path.mjs` | **A real WebRTC data channel** negotiated through the server |
+| `test/turn-relay.mjs` | **TURN forced** (`iceTransportPolicy: relay`) so relaying is proven |
 
 `e2e.mjs` runs against a live `wrangler dev`, not mocks — the point is to verify the
 SQLite store, the alarm beat and the gateway together under the real runtime.
@@ -113,6 +115,14 @@ relay counter that the server refuses.
 ```bash
 DSH_REPO=/path/to/ds-harness-remote npx tsx test/data-plane.mjs   https://your-worker owner@example.com 'your-password'
 ```
+
+`webrtc-path.mjs` and `turn-relay.mjs` cover the negotiated transports with
+`@roamhq/wrtc` — a real native WebRTC stack, so ICE, DTLS and SCTP are genuine. The
+second one is the one that matters operationally: it sets
+`iceTransportPolicy: 'relay'`, which makes the agent gather *only* relayed
+candidates, so the only way a connection can form is through the TURN server. That is
+the situation a peer behind a symmetric NAT is in, and it is the only test that
+proves an issued credential actually works rather than merely being well-formed.
 
 ## Design notes
 
