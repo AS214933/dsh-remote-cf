@@ -34,6 +34,8 @@ interface Attachment {
   capabilities?: string[]
   version?: string
   lastPong?: number
+  /** When this socket completed hello; used to tell a retry from a real second instance. */
+  connectedAt?: number
   nonce?: string | undefined
   /** Frame budget window, reset per second. */
   windowStart?: number
@@ -274,8 +276,28 @@ export class Gateway extends DurableObject<Env> {
     if (attachment.state !== 'awaiting_hello') return
 
     // Replace an existing connection for this device.
+    //
+    // The reason matters to the client: 4003 means "another instance owns this identity,
+    // stop reconnecting", which is right for a genuine second instance but wrong for a
+    // reconnect race. A client that drops and reconnects can reach here while its old
+    // socket is still registered — the close frame has not arrived yet — and answering
+    // 4003 then leaves it permanently disconnected for a reason that is not real.
+    //
+    // So the reason is chosen by age: a previous socket that has been up for less than a
+    // minute is almost certainly the same client retrying, and gets a retryable close. A
+    // long-lived one really is a second instance taking over.
     const previous = this.peers.get(hello.deviceId)
-    if (previous !== undefined && previous !== ws) this.disconnect(hello.deviceId, 'CONNECTION_REPLACED')
+    if (previous !== undefined && previous !== ws) {
+      const previousAttachment = (previous.deserializeAttachment() ?? {}) as Attachment
+      const ageMs = Date.now() - (previousAttachment.connectedAt ?? 0)
+      const raceWindowMs = 60_000
+      const reason = ageMs < raceWindowMs ? 'CONNECTION_FAILED' : 'CONNECTION_REPLACED'
+      console.warn('replacing live peer connection', {
+        deviceId: hello.deviceId, role: hello.role, clientVersion: hello.clientVersion,
+        previousAgeMs: ageMs, reason,
+      })
+      this.disconnect(hello.deviceId, reason)
+    }
 
     attachment.state = 'authenticated'
     attachment.deviceId = hello.deviceId
@@ -283,6 +305,7 @@ export class Gateway extends DurableObject<Env> {
     attachment.capabilities = this.negotiatedCapabilities(hello.capabilities)
     attachment.version = hello.clientVersion ?? device.client_version
     attachment.lastPong = Date.now()
+    attachment.connectedAt = Date.now()
     ws.serializeAttachment(attachment)
 
     this.peers.set(hello.deviceId, ws)
@@ -330,6 +353,7 @@ export class Gateway extends DurableObject<Env> {
       const { nonce } = parsePingPong(frame.payload)
       if (attachment.nonce !== undefined && nonce === attachment.nonce) {
         attachment.lastPong = Date.now()
+    attachment.connectedAt = Date.now()
         attachment.nonce = undefined
         ws.serializeAttachment(attachment)
       }
@@ -465,6 +489,11 @@ export class Gateway extends DurableObject<Env> {
     const concurrentAllowed = this.env.DSH_SERVER_ALLOW_CONCURRENT_HOSTS === '1' || modernHost(hostVersion)
     for (const old of [...this.links.values()]) {
       if (old.client === attachment.deviceId || (old.host === request.hostDeviceId && !concurrentAllowed)) {
+        console.warn('dropping link for a new connection', {
+          linkId: old.id, host: old.host, client: old.client,
+          reason: old.client === attachment.deviceId ? 'same client' : 'legacy host, one link only',
+          hostVersion,
+        })
         this.dropLink(old, 'CONNECTION_REPLACED')
       }
     }
