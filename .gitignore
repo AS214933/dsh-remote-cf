@@ -1,9 +1,14 @@
 node_modules/
 .wrangler/
-.dev.vars
 *.log
 .DS_Store
-secrets.local
+coverage/
+
+# Local-only files: they carry deployment identity or credentials and must never be
+# committed. wrangler.local.jsonc is the real deployment config; wrangler.jsonc stays
+# a neutral template so this repository can be public.
 wrangler.local.jsonc
-secrets.local
 .dev.vars
+secrets.local
+.env
+.env.*

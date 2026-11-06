@@ -54,15 +54,26 @@ transports. It cannot decrypt sessions, prompts or tool output.
 ```bash
 npm install
 
-# Required secrets — never as plain vars, which are readable in the dashboard.
-npx wrangler secret put SESSION_SECRET          # >= 16 chars, signs session cookies
-npx wrangler secret put DSH_SERVER_PASSWORD     # >= 8 chars
+# 1. Your deployment config. wrangler.jsonc is a neutral template: it carries no
+#    account id and no hostname, so this repository can stay public. Copy it and put
+#    the real values in the copy, which is gitignored.
+cp wrangler.jsonc wrangler.local.jsonc
+$EDITOR wrangler.local.jsonc     # account_id, DSH_SERVER_ACCOUNT, PUBLIC_URL, routes
 
-# Edit wrangler.jsonc for your account and public URL, then:
-npx wrangler deploy
+# 2. Required secrets — never as plain vars, which are readable in the dashboard.
+#    `--config` keeps them attached to the same Worker name.
+npx wrangler secret put SESSION_SECRET          --config wrangler.local.jsonc   # >= 16 chars
+npx wrangler secret put DSH_SERVER_PASSWORD     --config wrangler.local.jsonc   # >= 8 chars
+
+# 3. Deploy.
+npx wrangler deploy --config wrangler.local.jsonc
 ```
 
-`wrangler.jsonc` `vars` holds the non-secret settings:
+Keep `wrangler.local.jsonc` out of version control. If you fork this to publish your
+own instance, that file is where your identity stays.
+
+`wrangler.jsonc` `vars` holds the non-secret settings (the template values are
+placeholders and must be overridden in `wrangler.local.jsonc`):
 
 | Variable | Meaning |
 | --- | --- |

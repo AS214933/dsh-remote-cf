@@ -55,15 +55,23 @@ Object：一个实例、一个有状态 actor、长连接。在这个平台上�
 ```bash
 npm install
 
-# 必需密钥 —— 必须用 secret，不能写成 var（var 在面板可读、会被 deploy 回显）
-npx wrangler secret put SESSION_SECRET          # >= 16 字符，签会话 cookie
-npx wrangler secret put DSH_SERVER_PASSWORD     # >= 8 字符
+# 1. 你的部署配置。wrangler.jsonc 是中立模板：不含账户 ID、不含任何域名，
+#    这样仓库可以公开。复制一份，把真实值写进副本，副本已被 gitignore。
+cp wrangler.jsonc wrangler.local.jsonc
+$EDITOR wrangler.local.jsonc     # account_id、DSH_SERVER_ACCOUNT、PUBLIC_URL、routes
 
-# 改 wrangler.jsonc 里的 account_id 和 PUBLIC_URL，然后：
-npx wrangler deploy
+# 2. 必需密钥 —— 必须用 secret，不能写成 var（var 在面板可读、会被 deploy 回显）
+npx wrangler secret put SESSION_SECRET       --config wrangler.local.jsonc   # >= 16 字符
+npx wrangler secret put DSH_SERVER_PASSWORD  --config wrangler.local.jsonc   # >= 8 字符
+
+# 3. 部署
+npx wrangler deploy --config wrangler.local.jsonc
 ```
 
-`wrangler.jsonc` 的 `vars` 放非敏感配置：
+`wrangler.local.jsonc` 不要进版本控制。如果你 fork 出去发布自己的实例，
+你的身份信息就只留在那个文件里。
+
+`wrangler.jsonc` 的 `vars` 放非敏感配置（模板值是占位符，必须在 `wrangler.local.jsonc` 里覆盖）：
 
 | 变量 | 含义 |
 | --- | --- |
