@@ -158,6 +158,11 @@ export class Gateway extends DurableObject<Env> {
     let frame: ControlFrame
     try {
       frame = decodeControlFrame(raw)
+      // Every frame type, so a link that never leaves `accepted` can be told apart from
+      // one whose handshake frames are being dropped.
+      if (frame.type !== 'ping' && frame.type !== 'pong') {
+        console.warn('frame in', { type: frame.type, deviceId: attachment.deviceId })
+      }
     } catch (error) {
       this.fail(ws, error instanceof ProtocolError ? error.code : 'INVALID_MESSAGE')
       return
@@ -395,9 +400,19 @@ export class Gateway extends DurableObject<Env> {
     }
     if (frame.type === 'secure.handshake') {
       const { step } = parseSecureHandshake(frame.payload)
-      if (step === 1 && attachment.deviceId === link.client && link.stage === 'accepted') link.stage = 'handshake'
-      else if (step === 2 && attachment.deviceId === link.host && link.stage === 'handshake') link.stage = 'ready'
-      else throw new ProtocolError('INVALID_MESSAGE')
+      if (step === 1 && attachment.deviceId === link.client && link.stage === 'accepted') {
+        link.stage = 'handshake'
+        console.warn('link stage', { linkId: link.id, stage: link.stage })
+      } else if (step === 2 && attachment.deviceId === link.host && link.stage === 'handshake') {
+        link.stage = 'ready'
+        console.warn('link stage', { linkId: link.id, stage: link.stage })
+      } else {
+        console.warn('handshake rejected', {
+          linkId: link.id, step, stage: link.stage,
+          from: attachment.deviceId === link.client ? 'client' : 'host',
+        })
+        throw new ProtocolError('INVALID_MESSAGE')
+      }
       this.send(other, frame)
       return
     }
@@ -443,6 +458,7 @@ export class Gateway extends DurableObject<Env> {
       return
     }
     link.stage = 'accepted'
+    console.warn('link stage', { linkId: link.id, stage: link.stage, transports: link.preferredTransports })
     if (clientSocket !== undefined) this.send(clientSocket, frame)
   }
 
@@ -545,8 +561,18 @@ export class Gateway extends DurableObject<Env> {
     other: WebSocket,
     frame: ControlFrame,
   ): void {
-    if (sender.deviceId !== link.client) return
-    if (link.stage !== 'accepted' && link.stage !== 'handshake') throw new ProtocolError('INVALID_MESSAGE')
+    if (sender.deviceId !== link.client) {
+      // The reference documents this as compatibility: a Host announcing its own choice
+      // after its data channel opens is ignored by clients, so dropping it here keeps the
+      // link alive. Logged because a silently dropped selection looks like a stalled
+      // handshake from the outside.
+      console.warn('dropped transport.selected from the host', { linkId: link.id, stage: link.stage })
+      return
+    }
+    if (link.stage !== 'accepted' && link.stage !== 'handshake') {
+      console.warn('transport.selected outside the negotiating window', { linkId: link.id, stage: link.stage })
+      throw new ProtocolError('INVALID_MESSAGE')
+    }
     const { transport } = parseTransportSelected(frame.payload)
     const selected: TransportName = transport === 'lan'
       && !link.preferredTransports.includes('lan')
@@ -564,8 +590,14 @@ export class Gateway extends DurableObject<Env> {
   private forwardSignal(
     link: Link, sender: Attachment & { deviceId: string }, other: WebSocket, frame: ControlFrame,
   ): void {
-    if (link.stage === 'ready') return
-    if (!link.preferredTransports.some(transport => transport !== 'relay')) return
+    if (link.stage === 'ready') {
+      console.warn('dropped signaling after the link became ready', { linkId: link.id, type: frame.type })
+      return
+    }
+    if (!link.preferredTransports.some(transport => transport !== 'relay')) {
+      console.warn('dropped signaling on a relay-only link', { linkId: link.id, type: frame.type })
+      return
+    }
 
     if (frame.type === 'signal.offer') {
       if (sender.deviceId !== link.client) throw new ProtocolError('INVALID_MESSAGE')
