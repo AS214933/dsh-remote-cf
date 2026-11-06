@@ -62,13 +62,13 @@ const WEBRTC_FALLBACK_TIMEOUT_MS = 12_000
  * identical under load — a client that gets refused at 256 against the original will be
  * refused here too, rather than discovering a different failure mode later.
  */
-const MAX_PEERS = 256
-const MAX_LINKS = 256
+export const MAX_PEERS = 256
+export const MAX_LINKS = 256
 /** Drop a slow consumer past this much in flight, mirroring `bufferedAmount > 4 MiB`. */
 const MAX_BUFFERED_BYTES = 4 * MAX_RELAY_FRAME_BYTES
 const LINK_PENDING_TIMEOUT_MS = 30_000
 /** Client-visible code for "another instance took over this identity". */
-const CLOSE_CODE_REPLACED = 4003
+export const CLOSE_CODE_REPLACED = 4003
 const SERVER_VERSION = 'cf/0.1.0'
 
 export class Gateway extends DurableObject<Env> {
@@ -453,10 +453,18 @@ export class Gateway extends DurableObject<Env> {
       && hostCapabilities.includes(capabilityFor(transport)))
     if (preferredTransports.length === 0) throw new ProtocolError('CAPABILITY_NOT_SUPPORTED')
 
-    // One link per client, and for older hosts one per host too.
+    // One link per client. For an *old* Host, one link per Host as well — those builds
+    // cannot track more than one peer, so a second client would corrupt its state.
+    //
+    // `DSH_SERVER_ALLOW_CONCURRENT_HOSTS=1` lifts the per-Host limit regardless of
+    // version. The gate exists for Hosts that predate concurrent-client support; an
+    // operator who knows their Hosts are newer (or who is running a prerelease whose
+    // version string sorts below the threshold) can turn it off instead of being stuck
+    // with one device at a time.
     const hostVersion = hostAttachment.version ?? hostDevice.client_version
+    const concurrentAllowed = this.env.DSH_SERVER_ALLOW_CONCURRENT_HOSTS === '1' || modernHost(hostVersion)
     for (const old of [...this.links.values()]) {
-      if (old.client === attachment.deviceId || (old.host === request.hostDeviceId && !modernHost(hostVersion))) {
+      if (old.client === attachment.deviceId || (old.host === request.hostDeviceId && !concurrentAllowed)) {
         this.dropLink(old, 'CONNECTION_REPLACED')
       }
     }
@@ -872,4 +880,35 @@ export class Gateway extends DurableObject<Env> {
   }
 
   async clearFailures(key: string): Promise<void> { this.store.clearFailures(key) }
+
+  // --- oauth sessions ------------------------------------------------------
+
+  async createOAuthSession(input: { qrId: string; provider: string; expiresAt: number }): Promise<void> {
+    this.store.createOAuthSession(input)
+  }
+
+  async getOAuthSession(qrId: string): Promise<{
+    qrId: string; provider: string; status: string
+    account: string | null; isAdmin: number | null; token: string | null; expiresAt: number
+  } | null> {
+    return this.store.getOAuthSession(qrId)
+  }
+
+  async completeOAuthSession(
+    qrId: string, account: string, isAdmin: boolean, token: string,
+  ): Promise<boolean> {
+    return this.store.completeOAuthSession(qrId, account, isAdmin, token)
+  }
+
+  async takeOAuthToken(qrId: string): Promise<{ account: string; isAdmin: boolean; token: string } | null> {
+    return this.store.takeOAuthToken(qrId)
+  }
+
+  async setOAuthPkce(qrId: string, verifier: string): Promise<void> {
+    this.store.setOAuthPkce(qrId, verifier)
+  }
+
+  async getOAuthPkce(qrId: string): Promise<string | null> {
+    return this.store.getOAuthPkce(qrId)
+  }
 }

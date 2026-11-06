@@ -19,7 +19,9 @@
   },
   "vars": {
     "DSH_SERVER_ACCOUNT": "owner@example.com",
-    "DSH_SERVER_PUBLIC_URL": "http://127.0.0.1:8787",
+    "DSH_SERVER_PUBLIC_URL": "http://127.0.0.1:8790",
+    "OAUTH_PROVIDERS": "[{\"id\": \"mock\", \"displayName\": \"Mock IdP\", \"authorizeUrl\": \"http://127.0.0.1:8790/authorize\", \"tokenUrl\": \"http://127.0.0.1:8901/token\", \"userInfoUrl\": \"http://127.0.0.1:8901/user\", \"clientId\": \"mock-client\", \"scopes\": \"read:user user:email\", \"accountField\": \"email\", \"emailUrl\": \"http://127.0.0.1:8901/user/emails\", \"emailListField\": \"email\", \"emailPrimaryField\": \"primary\"}]",
+    "OAUTH_MOCK_CLIENT_SECRET": "mock-secret",
     // Both are local-only fixtures. `DSH_SERVER_PASSWORD` must still be at least 8
     // characters because the Worker refuses to start otherwise.
     "DSH_SERVER_PASSWORD": "local-dev-only",

@@ -19,5 +19,8 @@
   },
   "allowScripts": {
     "workerd@1.20261104.1": true
+  },
+  "dependencies": {
+    "@logto/js": "^6.1.2"
   }
 }

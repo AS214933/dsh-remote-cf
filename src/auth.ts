@@ -79,3 +79,15 @@ export function assertConfigured(env: Env): void {
     throw new Error('SESSION_SECRET (at least 16 characters) is required to sign session cookies')
   }
 }
+
+/**
+ * Whether the password form is turned off.
+ *
+ * `DSH_SERVER_PASSWORD_LOGIN=disabled` leaves OIDC as the only way in. The account and
+ * password stay configured — `assertConfigured` still requires them — so flipping the
+ * switch back does not require reconfiguring the deployment.
+ */
+export function passwordLoginDisabled(env: Env): boolean {
+  const value = env.DSH_SERVER_PASSWORD_LOGIN?.trim().toLowerCase()
+  return value === 'disabled' || value === 'off' || value === 'false'
+}

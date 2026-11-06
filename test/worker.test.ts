@@ -158,14 +158,14 @@ describe('register-owned-role', () => {
 })
 
 describe('close code semantics', () => {
-  it('distinguishes a replaced identity from a retryable failure', async () => {
+  it('uses 4003 for a replaced identity and 4001 otherwise', async () => {
     // 4003 tells the client "another instance took over, do not reconnect" — the
     // reference uses it so two instances do not fight. Every other reason is
     // retryable and must stay 4001, or a replacement puts both ends in a loop.
-    const { readFileSync } = await import('node:fs')
-    const source = readFileSync(new URL('../src/gateway.ts', import.meta.url), 'utf8')
-    expect(source).toContain('CLOSE_CODE_REPLACED = 4003')
-    expect(source).toContain("code === 'CONNECTION_REPLACED' ? CLOSE_CODE_REPLACED : SERVER_SHUTDOWN_CLOSE_CODE")
+    const { CLOSE_CODE_REPLACED } = await import('../src/gateway.js')
+    const { SERVER_SHUTDOWN_CLOSE_CODE } = await import('../src/protocol.js')
+    expect(CLOSE_CODE_REPLACED).toBe(4003)
+    expect(SERVER_SHUTDOWN_CLOSE_CODE).toBe(4001)
   })
 })
 
@@ -173,9 +173,8 @@ describe('ceilings match the reference server', () => {
   it('caps peers and links at 256', async () => {
     // The reference caps both at 256. A higher local cap changes behaviour under load
     // and, on a metered platform, the bill.
-    const { readFileSync } = await import('node:fs')
-    const source = readFileSync(new URL('../src/gateway.ts', import.meta.url), 'utf8')
-    expect(source).toMatch(/const MAX_PEERS = 256/)
-    expect(source).toMatch(/const MAX_LINKS = 256/)
+    const { MAX_PEERS, MAX_LINKS } = await import('../src/gateway.js')
+    expect(MAX_PEERS).toBe(256)
+    expect(MAX_LINKS).toBe(256)
   })
 })

@@ -21,6 +21,17 @@ export interface Env {
   readonly DSH_SERVER_ALLOWED_ORIGINS?: string
   /** `assets` serves the SPA at `/`; anything else answers 418 at the root. */
   readonly DSH_SERVER_ROOT_PAGE?: string
+  /**
+   * `1` lets one Host serve several clients regardless of its reported version. Needed
+   * for Hosts whose version string sorts below the concurrent-client threshold, such as
+   * a prerelease build.
+   */
+  readonly DSH_SERVER_ALLOW_CONCURRENT_HOSTS?: string
+  /**
+   * `disabled` turns the password form off, leaving OIDC as the only way in. Anything
+   * else (including unset) keeps it enabled.
+   */
+  readonly DSH_SERVER_PASSWORD_LOGIN?: string
   /** Signs web session cookies. A secret, at least 16 characters. */
   readonly SESSION_SECRET: string
 
@@ -29,10 +40,36 @@ export interface Env {
   /** The one Gateway instance holding every WebSocket. */
   readonly GATEWAY: DurableObjectNamespace<import('./gateway.js').Gateway>
 
+  // --- Logto (optional; password login works without it) ---
+  /** Tenant endpoint, e.g. https://auth.example.com (no /oidc suffix). */
+  readonly LOGTO_ENDPOINT?: string
+  readonly LOGTO_CLIENT_ID?: string
+  /** A secret: `wrangler secret put LOGTO_CLIENT_SECRET`. */
+  readonly LOGTO_CLIENT_SECRET?: string
+  /** API resource the access token is minted for. Optional. */
+  readonly LOGTO_API_RESOURCE?: string
+  /** Extra scopes beyond `openid profile email`, comma separated. */
+  readonly LOGTO_SCOPES?: string
+
+  // --- OAuth (optional; password login works without it) ---
+  /**
+   * JSON array of OAuth providers. A plain var, not a secret: each entry names the
+   * environment binding that holds its client secret, so nothing confidential is here.
+   */
+  readonly OAUTH_PROVIDERS?: string
+  /** Comma-separated accounts allowed to sign in via OAuth. Defaults to DSH_SERVER_ACCOUNT. */
+  readonly OAUTH_ALLOWED_ACCOUNTS?: string
+
   // --- Cloudflare Realtime TURN (optional; Relay works without it) ---
   readonly TURN_KEY_ID?: string
   readonly TURN_KEY_API_TOKEN?: string
   readonly TURN_CREDENTIAL_TTL_SECONDS?: string
+
+  /**
+   * Provider client secrets, named `OAUTH_<PROVIDER_ID>_CLIENT_SECRET` (upper-cased).
+   * Read through this index signature because the name depends on the provider list.
+   */
+  readonly [binding: `OAUTH_${string}_CLIENT_SECRET`]: string | undefined
 
   // --- Timing (all optional, bounded) ---
   readonly DSH_SERVER_HELLO_TIMEOUT_MS?: string

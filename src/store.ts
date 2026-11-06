@@ -79,6 +79,18 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS tokens_device ON tokens(device_id)`,
   `CREATE INDEX IF NOT EXISTS tokens_expiry ON tokens(expires_at)`,
+  `CREATE TABLE IF NOT EXISTS oauth_sessions (
+    qr_id      TEXT PRIMARY KEY,
+    provider   TEXT NOT NULL,
+    status     TEXT NOT NULL CHECK (status IN ('pending','complete','expired')),
+    account    TEXT,
+    is_admin   INTEGER,
+    token      TEXT,
+    pkce       TEXT,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS oauth_sessions_expiry ON oauth_sessions(expires_at)`,
   `CREATE TABLE IF NOT EXISTS lockout (
     key              TEXT PRIMARY KEY,
     failures         INTEGER NOT NULL,
@@ -235,6 +247,74 @@ export class Store {
 
   clearFailures(key: string): void {
     this.sql.exec('DELETE FROM lockout WHERE key = ?', key)
+  }
+
+  // --- oauth sessions ------------------------------------------------------
+
+  createOAuthSession(input: {
+    qrId: string; provider: string; expiresAt: number
+  }): void {
+    this.purgeExpiredOAuthSessions()
+    this.sql.exec(
+      'INSERT INTO oauth_sessions (qr_id, provider, status, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
+      input.qrId, input.provider, 'pending', input.expiresAt, Date.now(),
+    )
+  }
+
+  getOAuthSession(qrId: string): {
+    qrId: string; provider: string; status: string
+    account: string | null; isAdmin: number | null; token: string | null; expiresAt: number
+  } | null {
+    const row = this.sql.exec<{
+      qr_id: string; provider: string; status: string
+      account: string | null; is_admin: number | null; token: string | null; expires_at: number
+    }>('SELECT * FROM oauth_sessions WHERE qr_id = ?', qrId).toArray()[0]
+    if (row === undefined) return null
+    return {
+      qrId: row.qr_id, provider: row.provider, status: row.status,
+      account: row.account, isAdmin: row.is_admin, token: row.token, expiresAt: row.expires_at,
+    }
+  }
+
+  /**
+   * Mark a session complete and hand it the session token.
+   *
+   * Only a `pending` row may transition: a second callback for the same qr id would
+   * otherwise overwrite the token, and a callback replay is exactly what an attacker
+   * with a stolen `code` would attempt.
+   */
+  completeOAuthSession(qrId: string, account: string, isAdmin: boolean, token: string): boolean {
+    const existing = this.getOAuthSession(qrId)
+    if (existing === null || existing.status !== 'pending') return false
+    if (existing.expiresAt <= Date.now()) return false
+    this.sql.exec(
+      'UPDATE oauth_sessions SET status = ?, account = ?, is_admin = ?, token = ? WHERE qr_id = ? AND status = ?',
+      'complete', account, isAdmin ? 1 : 0, token, qrId, 'pending',
+    )
+    return true
+  }
+
+  /** Read the token once; the row keeps its complete status but loses the token. */
+  takeOAuthToken(qrId: string): { account: string; isAdmin: boolean; token: string } | null {
+    const row = this.getOAuthSession(qrId)
+    if (row === null || row.status !== 'complete' || row.token === null || row.account === null) return null
+    this.sql.exec('UPDATE oauth_sessions SET token = NULL WHERE qr_id = ?', qrId)
+    return { account: row.account, isAdmin: row.isAdmin === 1, token: row.token }
+  }
+
+  purgeExpiredOAuthSessions(now = Date.now()): void {
+    this.sql.exec('DELETE FROM oauth_sessions WHERE expires_at <= ?', now)
+  }
+
+  setOAuthPkce(qrId: string, verifier: string): void {
+    this.sql.exec('UPDATE oauth_sessions SET pkce = ? WHERE qr_id = ?', verifier, qrId)
+  }
+
+  getOAuthPkce(qrId: string): string | null {
+    const row = this.sql.exec<{ pkce: string | null }>(
+      'SELECT pkce FROM oauth_sessions WHERE qr_id = ?', qrId,
+    ).toArray()[0]
+    return row?.pkce ?? null
   }
 
   purgeExpiredLockouts(now: number, streakMs: number): void {

@@ -11,12 +11,16 @@
  */
 import type { Env } from './env.js'
 import { DEFAULT_LOCKOUT, RATE_LIMITS } from './config.js'
-import { assertConfigured, verifyCredentials } from './auth.js'
+import { assertConfigured, passwordLoginDisabled, verifyCredentials } from './auth.js'
 import { signSession, sha256Hex, verifySession, toBase64Url } from './crypto.js'
 import { turnIceServers } from './turn.js'
 import { isDeviceId, isIdentityKey } from './protocol.js'
 import type { Result } from './result.js'
 import { corsHeaders, parseAllowedOrigins, preflightResponse } from './cors.js'
+import {
+  handleCallback, landingPage, pollSession, providersResponse, startRedirect, startSession,
+  type OAuthDeps,
+} from './oauth-routes.js'
 
 // Durable Object classes must be exported from the entrypoint module so the
 // runtime can construct them; the binding name in wrangler.jsonc maps to this.
@@ -104,6 +108,14 @@ async function route(
 
   if (url.pathname === '/healthz' || url.pathname === '/health' || url.pathname === '/ready') {
     return Response.json({ status: 'ok' })
+  }
+
+  // OAuth browser routes run before the JSON API: they answer HTML and 303 redirects,
+  // and the QR landing page is opened by a phone browser that must not be handed a
+  // JSON error envelope.
+  if (url.pathname.startsWith('/api/v1/auth/oauth/') || url.pathname.startsWith('/api/v1/auth/q/')) {
+    const response = await routeOAuth(request, env, url)
+    if (response !== null) return response
   }
 
   if (url.pathname.startsWith('/api/')) {
@@ -474,6 +486,11 @@ async function login(request: Request, env: Env, client: string): Promise<Respon
     })
   }
 
+  // OIDC-only mode. Refused before touching the password: a disabled credential must not
+  // be brute-forceable, and a rejection must not consume lockout budget for the login
+  // path the operator actually uses.
+  if (passwordLoginDisabled(env)) throw new ApiError('PASSWORD_LOGIN_DISABLED', 403)
+
   const outcome = await verifyCredentials(env, email, password)
   if (!outcome.ok) {
     if (outcome.reason === 'misconfigured') throw new ApiError('AUTH_SERVICE_UNAVAILABLE', 503)
@@ -680,3 +697,59 @@ async function gatewayStub(env: Env) {
 
 void toBase64Url
 void deviceIdFromRequest
+
+// ---------------------------------------------------------------------------
+// OAuth routing
+// ---------------------------------------------------------------------------
+
+/**
+ * Dispatch the OAuth routes, or return null when the path is not one of them.
+ *
+ * Kept separate from `handleApi` because these answer HTML and redirects rather than
+ * JSON: the QR landing page is opened by a phone browser, and a JSON error envelope
+ * there would leave the user staring at raw braces.
+ */
+async function routeOAuth(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const deps: OAuthDeps = {
+    call: (method, args) => callGateway(env, method, args),
+    issueSession: async account => {
+      const expiresAt = Date.now() + SESSION_TTL_MS
+      const token = await signSession(sessionSecret(env), { account, expiresAt })
+      return { token, expiresAt }
+    },
+    errorResponse,
+    readJson,
+    rate,
+    clientKey,
+  }
+
+  if (request.method === 'GET' && url.pathname === '/api/v1/auth/oauth/providers') {
+    return providersResponse(env)
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/v1/auth/oauth/qr/start') {
+    return startSession(request, env, deps)
+  }
+
+  const pollMatch = /^\/api\/v1\/auth\/oauth\/qr\/([^/]+)$/.exec(url.pathname)
+  if (request.method === 'GET' && pollMatch !== null) {
+    return pollSession(request, env, deps, decodeURIComponent(pollMatch[1]!))
+  }
+
+  const landingMatch = /^\/api\/v1\/auth\/q\/([^/]+)$/.exec(url.pathname)
+  if (request.method === 'GET' && landingMatch !== null) {
+    return landingPage(request, env, deps, decodeURIComponent(landingMatch[1]!))
+  }
+
+  const startMatch = /^\/api\/v1\/auth\/oauth\/([^/]+)\/start$/.exec(url.pathname)
+  if (request.method === 'GET' && startMatch !== null) {
+    return startRedirect(request, env, deps)
+  }
+
+  const callbackMatch = /^\/api\/v1\/auth\/oauth\/([^/]+)\/callback$/.exec(url.pathname)
+  if (request.method === 'GET' && callbackMatch !== null) {
+    return handleCallback(request, env, deps)
+  }
+
+  return null
+}

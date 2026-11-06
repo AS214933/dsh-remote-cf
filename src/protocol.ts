@@ -283,13 +283,32 @@ export function isDeviceId(value: unknown): value is string {
 }
 
 /**
- * `modernHost` gate from the reference implementation: hosts at or above
- * 0.2.15 support concurrent clients, so the server must not drop their older
- * links when a new one is requested.
+ * `modernHost` gate: hosts at or above 0.2.15 support concurrent clients, so the server
+ * must not drop their existing links when a new one is requested.
+ *
+ * The version may carry a prerelease tag (`0.2.1-rc.5`) or build metadata
+ * (`0.2.15+build`). The reference regex only accepts `+metadata`, which makes every
+ * prerelease build look like a legacy host — and a legacy host may hold only one link,
+ * so a phone connecting kicks the desktop off with `CONNECTION_REPLACED`. Accepting the
+ * prerelease suffix is what keeps a release candidate usable as a host.
+ *
+ * Comparison follows semver: a prerelease of `0.2.15` sorts *below* `0.2.15`, so
+ * `0.2.15-rc.1` is not modern while `0.2.15` is.
  */
 export function modernHost(version: string): boolean {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:\+.*)?$/.exec(version)
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version)
   if (!match) return false
-  const [major, minor, patch] = match.slice(1).map(Number) as [number, number, number]
-  return major > 0 || minor > 2 || (minor === 2 && patch >= 15)
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  const patch = Number(match[3])
+  const prerelease = match[4]
+
+  const threshold: [number, number, number] = [0, 2, 15]
+  const actual: [number, number, number] = [major, minor, patch]
+  for (let i = 0; i < 3; i += 1) {
+    if (actual[i]! > threshold[i]!) return true
+    if (actual[i]! < threshold[i]!) return false
+  }
+  // Equal core version: a prerelease is lower than the release it precedes.
+  return prerelease === undefined
 }
