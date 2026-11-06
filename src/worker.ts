@@ -48,6 +48,26 @@ export default {
     // Fail fast on a misconfigured deployment rather than at first login.
     assertConfigured(env)
 
+    // --- WebSocket: validate cheaply here, then hand to the DO --------------
+    // Validation happens in the Worker on purpose: Cloudflare bills Durable Object
+    // requests, so rejecting a bad upgrade before the hop is the difference between
+    // a free 403 and a billed one.
+    if (url.pathname === '/ws/v1/connect') {
+      if (request.headers.get('Upgrade') !== 'websocket') {
+        return errorResponse('INVALID_MESSAGE', 426)
+      }
+      // Origin must match the public URL. A non-browser client (the Host plugin via
+      // Node's WebSocket) sends no Origin at all, which is fine: the access token in
+      // the hello frame is what authenticates it.
+      const origin = request.headers.get('Origin')
+      if (origin !== null && origin !== env.DSH_SERVER_PUBLIC_URL) {
+        return errorResponse('AUTH_INVALID', 403)
+      }
+      // Credentials travel in the hello frame, never in the URL.
+      if (url.search !== '') return errorResponse('INVALID_MESSAGE', 403)
+      return env.GATEWAY.getByName('gateway').fetch(request)
+    }
+
     if (url.pathname === '/healthz' || url.pathname === '/health' || url.pathname === '/ready') {
       return Response.json({ status: 'ok' })
     }

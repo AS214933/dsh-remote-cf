@@ -85,9 +85,23 @@ config is `wrangler.jsonc`.
 | `test/protocol.test.ts` | Frame decoding, limits, duplicate-key rejection, identifier and version parsing |
 | `test/crypto.test.ts` | Digests, session cookie signing/tampering/expiry, timing equalisation, config bounds |
 | `test/e2e.mjs` | Live Worker + Durable Object: login, device lifecycle, token rotation and reuse, WebSocket handshake |
+| `test/host-connect.mjs` | **The real Host plugin client** against a live server |
 
 `e2e.mjs` runs against a live `wrangler dev`, not mocks — the point is to verify the
 SQLite store, the alarm beat and the gateway together under the real runtime.
+
+`host-connect.mjs` goes further: it imports `HostServerApi`, `IdentityStore` and
+`ServerCredentialStore` from a `ds-harness-remote` checkout and drives them against
+this server, so a contract mismatch shows up here rather than in production. Point
+`DSH_REPO` at that checkout:
+
+```bash
+DSH_REPO=/path/to/ds-harness-remote npx tsx test/host-connect.mjs   https://your-worker owner@example.com 'your-password'
+```
+
+It covers: real X25519 identity creation, account login and device registration
+through the shipped API, credential load, the host read paths, the control WebSocket
+hello, and a heartbeat ping/pong round trip.
 
 ## Design notes
 

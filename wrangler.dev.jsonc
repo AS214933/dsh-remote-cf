@@ -9,7 +9,7 @@
   "assets": { "directory": "./public", "binding": "ASSETS", "not_found_handling": "single-page-application" },
   "vars": {
     "DSH_SERVER_ACCOUNT": "owner@example.com",
-    "DSH_SERVER_PUBLIC_URL": "http://127.0.0.1:8812",
+    "DSH_SERVER_PUBLIC_URL": "http://127.0.0.1:8835",
     "DSH_SERVER_PASSWORD": "local-dev-only",
     "SESSION_SECRET": "local-dev-only-session-secret"
   }
