@@ -1,7 +1,12 @@
 {
+  // Template config for the open-source repo.
+  //
+  // Nothing here is specific to any deployment: no account id, no hostname. Copy the
+  // real values in `wrangler.local.jsonc` (gitignored) or set them as GitHub Actions
+  // secrets. Keeping deployment identity out of the tracked file is what lets this
+  // repository be public without publishing an operator's account details.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "dsh-relay",
-  "account_id": "<your-account-id>",
   "main": "src/worker.ts",
   "compatibility_date": "2026-04-07",
   "compatibility_flags": ["nodejs_compat"],
@@ -11,15 +16,15 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gateway"] }],
   "assets": {
     "directory": "./public",
+    // The Worker decides every route, including `/`. Without this, static assets
+    // answer for matching paths before the Worker runs and the 418 rule cannot apply
+    // to the root — which is what made the server look like it had a web UI.
     "binding": "ASSETS",
     "run_worker_first": true,
     "not_found_handling": "none"
   },
   "observability": { "enabled": true },
   "workers_dev": true,
-  "routes": [
-    { "pattern": "dsh-relay.example.workers.dev", "custom_domain": true }
-  ],
   "vars": {
     "DSH_SERVER_ACCOUNT": "owner@example.com",
     "DSH_SERVER_PUBLIC_URL": "https://dsh-relay.example.workers.dev"

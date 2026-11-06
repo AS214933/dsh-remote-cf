@@ -1,4 +1,9 @@
 {
+  // Local development config. Safe to commit: every value is a throwaway used only
+  // against a local `wrangler dev`, never against a deployed Worker.
+  //
+  // Real deployments do not use this file. They set `DSH_SERVER_ACCOUNT` in
+  // wrangler.jsonc (or CI) and the two secrets with `wrangler secret put`.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "dsh-remote-server",
   "main": "src/worker.ts",
@@ -6,10 +11,17 @@
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": { "bindings": [{ "name": "GATEWAY", "class_name": "Gateway" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gateway"] }],
-  "assets": { "directory": "./public", "binding": "ASSETS", "not_found_handling": "single-page-application" },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "not_found_handling": "none"
+  },
   "vars": {
     "DSH_SERVER_ACCOUNT": "owner@example.com",
-    "DSH_SERVER_PUBLIC_URL": "http://127.0.0.1:8835",
+    "DSH_SERVER_PUBLIC_URL": "http://127.0.0.1:8787",
+    // Both are local-only fixtures. `DSH_SERVER_PASSWORD` must still be at least 8
+    // characters because the Worker refuses to start otherwise.
     "DSH_SERVER_PASSWORD": "local-dev-only",
     "SESSION_SECRET": "local-dev-only-session-secret"
   }

@@ -14,6 +14,8 @@
 const BASE = process.env.E2E_BASE ?? 'http://127.0.0.1:8787'
 // Must match .dev.vars.
 const ACCOUNT = process.env.E2E_ACCOUNT ?? 'owner@example.com'
+// Must match the password in wrangler.dev.jsonc; override with E2E_PASSWORD when
+// running against something other than a local `wrangler dev`.
 const PASSWORD = process.env.E2E_PASSWORD ?? 'local-dev-only'
 
 let passed = 0

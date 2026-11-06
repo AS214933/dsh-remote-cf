@@ -143,6 +143,9 @@ npx vitest run                           # 45 个单元测试
 | `test/webrtc-path.mjs` | **真实 WebRTC 数据通道** 经服务端协商 |
 | `test/turn-relay.mjs` | **强制走 TURN**（`iceTransportPolicy: relay`）证明中继可用 |
 | `test/client-flow.mjs` | **插件真实登录流程**，含 Host 认领环节 |
+| `test/endpoint-contract.mjs` | **插件调用的每一个端点** —— 直接从其源码提取 |
+| `test/rpc-tunnel.mjs` | **隧道内的应用层 RPC**，证明服务端读不到明文 |
+| `test/soak.mjs` | **真实边缘的长连接**，结束后再走一次 RPC |
 
 `e2e.mjs` 跑在真实 `wrangler dev` 上而非 mock —— 目的就是把 SQLite 存储、
 alarm 心跳和网关放在真实运行时里一起验证。

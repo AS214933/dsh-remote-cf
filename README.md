@@ -98,6 +98,9 @@ config is `wrangler.jsonc`.
 | `test/webrtc-path.mjs` | **A real WebRTC data channel** negotiated through the server |
 | `test/turn-relay.mjs` | **TURN forced** (`iceTransportPolicy: relay`) so relaying is proven |
 | `test/client-flow.mjs` | **The plugin's real sign-in flow**, including the Host claim step |
+| `test/endpoint-contract.mjs` | **Every endpoint the plugin calls** — extracted from its source |
+| `test/rpc-tunnel.mjs` | **Application RPC inside the tunnel**, proving it stays opaque |
+| `test/soak.mjs` | **Long-lived connection** on the real edge, with an RPC afterwards |
 
 中文文档见 [README-zh.md](README-zh.md).
 
