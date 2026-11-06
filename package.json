@@ -1,0 +1,23 @@
+{
+  "name": "dsh-remote-cf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers port of the DSH Remote server: single account, Durable Object WebSocket gateway, Logto authentication, Realtime TURN.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8",
+    "wrangler": "^4.0.0"
+  },
+  "allowScripts": {
+    "workerd@1.20261104.1": true
+  }
+}
