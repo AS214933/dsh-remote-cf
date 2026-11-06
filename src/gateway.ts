@@ -71,6 +71,19 @@ const MAX_BUFFERED_BYTES = 4 * MAX_RELAY_FRAME_BYTES
 const LINK_PENDING_TIMEOUT_MS = 30_000
 /** Client-visible code for "another instance took over this identity". */
 export const CLOSE_CODE_REPLACED = 4003
+
+/**
+ * Frames worth logging on arrival: a handful per connection, all during setup.
+ *
+ * Everything else is either the data plane (`relay`) or periodic (`ping`/`pong`), and
+ * logging those would cost real money in Workers Logs while telling nothing new.
+ */
+const NEGOTIATION_FRAME_TYPES = new Set<string>([
+  'hello', 'connect.request', 'connect.incoming', 'connect.accepted', 'connect.rejected',
+  'secure.handshake', 'signal.offer', 'signal.answer', 'signal.ice',
+  'transport.selected', 'connection.lease.request', 'connection.lease.ack',
+  'connection.lease.close', 'error',
+])
 const SERVER_VERSION = 'cf/0.1.0'
 
 export class Gateway extends DurableObject<Env> {
@@ -158,9 +171,10 @@ export class Gateway extends DurableObject<Env> {
     let frame: ControlFrame
     try {
       frame = decodeControlFrame(raw)
-      // Every frame type, so a link that never leaves `accepted` can be told apart from
-      // one whose handshake frames are being dropped.
-      if (frame.type !== 'ping' && frame.type !== 'pong') {
+      // Negotiation frames only. `relay` is the data plane — a live session sends them
+      // continuously — so logging each one would turn a working tunnel into a log
+      // firehose, and `ping`/`pong` would add nothing but noise.
+      if (NEGOTIATION_FRAME_TYPES.has(frame.type)) {
         console.warn('frame in', { type: frame.type, deviceId: attachment.deviceId })
       }
     } catch (error) {
