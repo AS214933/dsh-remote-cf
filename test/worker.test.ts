@@ -156,3 +156,26 @@ describe('register-owned-role', () => {
     expect(response.status).not.toBe(418)
   })
 })
+
+describe('close code semantics', () => {
+  it('distinguishes a replaced identity from a retryable failure', async () => {
+    // 4003 tells the client "another instance took over, do not reconnect" — the
+    // reference uses it so two instances do not fight. Every other reason is
+    // retryable and must stay 4001, or a replacement puts both ends in a loop.
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../src/gateway.ts', import.meta.url), 'utf8')
+    expect(source).toContain('CLOSE_CODE_REPLACED = 4003')
+    expect(source).toContain("code === 'CONNECTION_REPLACED' ? CLOSE_CODE_REPLACED : SERVER_SHUTDOWN_CLOSE_CODE")
+  })
+})
+
+describe('ceilings match the reference server', () => {
+  it('caps peers and links at 256', async () => {
+    // The reference caps both at 256. A higher local cap changes behaviour under load
+    // and, on a metered platform, the bill.
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../src/gateway.ts', import.meta.url), 'utf8')
+    expect(source).toMatch(/const MAX_PEERS = 256/)
+    expect(source).toMatch(/const MAX_LINKS = 256/)
+  })
+})

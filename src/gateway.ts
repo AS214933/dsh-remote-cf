@@ -54,11 +54,21 @@ interface Link {
 }
 
 const WEBRTC_FALLBACK_TIMEOUT_MS = 12_000
-const MAX_PEERS = 512
-const MAX_LINKS = 512
+/**
+ * Connection and link ceilings, matching the reference server exactly.
+ *
+ * These are not arbitrary: the reference caps both at 256, and exceeding the platform's
+ * budget is silent until the bill arrives. Matching the reference also keeps behaviour
+ * identical under load — a client that gets refused at 256 against the original will be
+ * refused here too, rather than discovering a different failure mode later.
+ */
+const MAX_PEERS = 256
+const MAX_LINKS = 256
 /** Drop a slow consumer past this much in flight, mirroring `bufferedAmount > 4 MiB`. */
 const MAX_BUFFERED_BYTES = 4 * MAX_RELAY_FRAME_BYTES
 const LINK_PENDING_TIMEOUT_MS = 30_000
+/** Client-visible code for "another instance took over this identity". */
+const CLOSE_CODE_REPLACED = 4003
 const SERVER_VERSION = 'cf/0.1.0'
 
 export class Gateway extends DurableObject<Env> {
@@ -356,8 +366,7 @@ export class Gateway extends DurableObject<Env> {
       return
     }
     if (frame.type === 'transport.selected') {
-      parseTransportSelected(frame.payload)
-      this.send(other, frame)
+      this.forwardTransportSelected(link, attachment, other, frame)
       return
     }
     if (frame.type === 'secure.handshake') {
@@ -480,6 +489,41 @@ export class Gateway extends DurableObject<Env> {
    * to coordinate, and a Host treats unsolicited signaling as a protocol
    * violation, so such frames are dropped for the client to time out and fall back.
    */
+  /**
+   * Forward the initiator's transport choice, gated exactly as the reference does.
+   *
+   * Three behaviours here are compatibility, not strictness:
+   *
+   * - Only the Client (initiator) may select. A Host may also announce its own choice
+   *   once its data channel opens; clients ignore that, so dropping it here keeps the
+   *   link alive instead of failing the handshake.
+   * - `lan` degrades to `p2p` when the link never negotiated `transport.lan` (older
+   *   peers). Without the downgrade an old client's `lan` would be refused outright.
+   * - A `relay` selection is not sent to a Host older than the concurrency change,
+   *   because that Host does not understand it and would treat it as a protocol error.
+   */
+  private forwardTransportSelected(
+    link: Link,
+    sender: Attachment & { deviceId: string },
+    other: WebSocket,
+    frame: ControlFrame,
+  ): void {
+    if (sender.deviceId !== link.client) return
+    if (link.stage !== 'accepted' && link.stage !== 'handshake') throw new ProtocolError('INVALID_MESSAGE')
+    const { transport } = parseTransportSelected(frame.payload)
+    const selected: TransportName = transport === 'lan'
+      && !link.preferredTransports.includes('lan')
+      && link.preferredTransports.includes('p2p')
+      ? 'p2p'
+      : transport
+    if (!link.preferredTransports.includes(selected)) throw new ProtocolError('CAPABILITY_NOT_SUPPORTED')
+    const otherAttachment = (other.deserializeAttachment() ?? {}) as Attachment
+    if (selected === 'relay' && !modernHost(otherAttachment.version ?? '')) return
+    this.send(other, selected === transport
+      ? frame
+      : createControlFrame('transport.selected', { ...frame.payload, transport: selected }))
+  }
+
   private forwardSignal(
     link: Link, sender: Attachment & { deviceId: string }, other: WebSocket, frame: ControlFrame,
   ): void {
@@ -607,14 +651,23 @@ export class Gateway extends DurableObject<Env> {
     this.fail(ws, code)
   }
 
+  /**
+   * Close a socket, choosing the code by reason.
+   *
+   * The code is not cosmetic: 4003 means "another instance took over this identity",
+   * and the client stops reconnecting on it — correct, because reconnecting would just
+   * fight the newer instance. Every other reason is a failure the client should retry,
+   * so it gets 4001. Sending 4001 for a replacement would put two instances in a
+   * reconnect loop against each other.
+   */
   private closeQuietly(ws: WebSocket, code: string, frame?: ControlFrame): void {
     try {
       if (frame !== undefined) this.send(ws, frame)
-      ws.close(SERVER_SHUTDOWN_CLOSE_CODE, SERVER_SHUTDOWN_CLOSE_REASON)
+      const closeCode = code === 'CONNECTION_REPLACED' ? CLOSE_CODE_REPLACED : SERVER_SHUTDOWN_CLOSE_CODE
+      ws.close(closeCode, code)
     } catch {
       // Already closing; the runtime reaps it.
     }
-    void code
   }
 
   /** Send with a bounded in-flight budget, standing in for `bufferedAmount`. */
