@@ -126,3 +126,33 @@ describe('configuration guard', () => {
     await expect(get('/', env)).rejects.toThrow(/origin/)
   })
 })
+
+describe('register-owned-role', () => {
+  it('refuses an unauthenticated claim', async () => {
+    // The endpoint mints a device, so it must never work without a credential.
+    const response = await worker.fetch(
+      new Request(`${PUBLIC_URL}/api/v1/devices/register-owned-role`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ v: 1, device: {} }),
+      }),
+      makeEnv(),
+    )
+    expect(response.status).toBe(401)
+  })
+
+  it('is routed rather than answering 404 or 418', async () => {
+    // A 404 here is what broke the UI: signing in succeeded, then the host picker
+    // came up empty because the Host could never be claimed.
+    const response = await worker.fetch(
+      new Request(`${PUBLIC_URL}/api/v1/devices/register-owned-role`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ v: 1, device: {} }),
+      }),
+      makeEnv(),
+    )
+    expect(response.status).not.toBe(404)
+    expect(response.status).not.toBe(418)
+  })
+})

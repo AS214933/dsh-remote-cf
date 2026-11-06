@@ -1,3 +1,9 @@
+<div align="right">
+
+**English** | [简体中文](README-zh.md)
+
+</div>
+
 # dsh-remote-cf
 
 Cloudflare Workers port of the [DSH Remote](https://github.com/AS214933/ds-harness-remote) server.
@@ -63,6 +69,7 @@ npx wrangler deploy
 | `DSH_SERVER_ACCOUNT` | The one account, e.g. your email |
 | `DSH_SERVER_PUBLIC_URL` | Public origin; must match the browser origin exactly |
 | `DSH_SERVER_ROOT_PAGE` | `assets` serves the SPA at `/`; default answers 418 |
+| `DSH_SERVER_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to call the API |
 | `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` | Optional, for Cloudflare Realtime TURN |
 | `DSH_SERVER_HEARTBEAT_INTERVAL_MS` | Optional, default 25000, bounded 5000–120000 |
 
@@ -90,6 +97,7 @@ config is `wrangler.jsonc`.
 | `test/data-plane.mjs` | **A real Noise IK tunnel** through the server's relay |
 | `test/webrtc-path.mjs` | **A real WebRTC data channel** negotiated through the server |
 | `test/turn-relay.mjs` | **TURN forced** (`iceTransportPolicy: relay`) so relaying is proven |
+| `test/client-flow.mjs` | **The plugin's real sign-in flow**, including the Host claim step |
 
 中文文档见 [README-zh.md](README-zh.md).
 

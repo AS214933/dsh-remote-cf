@@ -16,6 +16,7 @@ import { signSession, sha256Hex, verifySession, toBase64Url } from './crypto.js'
 import { turnIceServers } from './turn.js'
 import { isDeviceId, isIdentityKey } from './protocol.js'
 import type { Result } from './result.js'
+import { corsHeaders, parseAllowedOrigins, preflightResponse } from './cors.js'
 
 // Durable Object classes must be exported from the entrypoint module so the
 // runtime can construct them; the binding name in wrangler.jsonc maps to this.
@@ -48,56 +49,88 @@ export default {
     // Fail fast on a misconfigured deployment rather than at first login.
     assertConfigured(env)
 
-    // --- WebSocket: validate cheaply here, then hand to the DO --------------
-    // Validation happens in the Worker on purpose: Cloudflare bills Durable Object
-    // requests, so rejecting a bad upgrade before the hop is the difference between
-    // a free 403 and a billed one.
-    if (url.pathname === '/ws/v1/connect') {
-      if (request.headers.get('Upgrade') !== 'websocket') {
-        return errorResponse('INVALID_MESSAGE', 426)
-      }
-      // Origin must match the public URL. A non-browser client (the Host plugin via
-      // Node's WebSocket) sends no Origin at all, which is fine: the access token in
-      // the hello frame is what authenticates it.
-      const origin = request.headers.get('Origin')
-      if (origin !== null && origin !== env.DSH_SERVER_PUBLIC_URL) {
-        return errorResponse('AUTH_INVALID', 403)
-      }
-      // Credentials travel in the hello frame, never in the URL.
-      if (url.search !== '') return errorResponse('INVALID_MESSAGE', 403)
-      return env.GATEWAY.getByName('gateway').fetch(request)
+    const allowedOrigins = parseAllowedOrigins(env.DSH_SERVER_ALLOWED_ORIGINS)
+
+    // --- CORS preflight ----------------------------------------------------
+    // Must be answered before anything else: the browser will not send the real
+    // request until this succeeds, so a 418 or a 403 here means the UI's login
+    // button does nothing and the server log stays empty.
+    if (request.method === 'OPTIONS' && allowedOrigins.length > 0) {
+      return preflightResponse(request, allowedOrigins)
     }
 
-    if (url.pathname === '/healthz' || url.pathname === '/health' || url.pathname === '/ready') {
-      return Response.json({ status: 'ok' })
+    // Attach CORS to every response below. Done once here rather than at each
+    // return site so a new route cannot forget it.
+    const withCors = (response: Response): Response => {
+      const headers = corsHeaders(request, allowedOrigins)
+      if (headers === null) return response
+      const merged = new Response(response.body, response)
+      for (const [name, value] of Object.entries(headers)) merged.headers.set(name, value)
+      return merged
     }
-
-    if (url.pathname.startsWith('/api/')) {
-      try {
-        return await handleApi(request, env, url)
-      } catch (error) {
-        return mapError(error)
-      }
-    }
-
-    // Everything else answers 418 by default.
-    //
-    // This deployment has no public web UI: the clients talk to /api/* and
-    // /ws/v1/connect, and nothing else is meant to be reachable. Returning a
-    // teapot instead of a page means a scanner probing for an admin panel, a
-    // .env, or a WordPress install gets the same boring answer as a real
-    // visitor, and learns that this origin is not a website. It also stops the
-    // static-asset handler from turning every unknown path into a 200 SPA shell,
-    // which previously made the server look like it had a UI it does not have.
-    //
-    // Set DSH_SERVER_ROOT_PAGE=assets to serve the SPA at / instead (for a
-    // deployment that does ship a UI).
-    if (url.pathname === '/' && env.DSH_SERVER_ROOT_PAGE === 'assets') {
-      return env.ASSETS.fetch(request)
-    }
-    return teapot()
+    return withCors(await route(request, env, url, allowedOrigins))
   },
 } satisfies ExportedHandler<Env>
+
+async function route(
+  request: Request,
+  env: Env,
+  url: URL,
+  allowedOrigins: readonly string[],
+): Promise<Response> {
+  // --- WebSocket: validate cheaply here, then hand to the DO --------------
+  // Validation happens in the Worker on purpose: Cloudflare bills Durable Object
+  // requests, so rejecting a bad upgrade before the hop is the difference between
+  // a free 403 and a billed one.
+  if (url.pathname === '/ws/v1/connect') {
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return errorResponse('INVALID_MESSAGE', 426)
+    }
+    // A browser sends Origin, so a browser-hosted workbench connecting from its own
+    // origin must be allowed. A non-browser client (the Host plugin on Node's
+    // WebSocket) sends no Origin at all, which is also fine — the access token in the
+    // hello frame is what authenticates it, not the Origin.
+    //
+    // An allowlist entry is required only when an Origin is present and not the
+    // server's own; `sameAuthorities` keeps a same-origin request from needing one.
+    const origin = request.headers.get('Origin')
+    if (origin !== null && origin !== env.DSH_SERVER_PUBLIC_URL && !allowedOrigins.includes(origin)) {
+      return errorResponse('AUTH_INVALID', 403)
+    }
+    // Credentials travel in the hello frame, never in the URL.
+    if (url.search !== '') return errorResponse('INVALID_MESSAGE', 403)
+    return env.GATEWAY.getByName('gateway').fetch(request)
+  }
+
+  if (url.pathname === '/healthz' || url.pathname === '/health' || url.pathname === '/ready') {
+    return Response.json({ status: 'ok' })
+  }
+
+  if (url.pathname.startsWith('/api/')) {
+    try {
+      return await handleApi(request, env, url)
+    } catch (error) {
+      return mapError(error)
+    }
+  }
+
+  // Everything else answers 418 by default.
+  //
+  // This deployment has no public web UI: the clients talk to /api/* and
+  // /ws/v1/connect, and nothing else is meant to be reachable. Returning a
+  // teapot instead of a page means a scanner probing for an admin panel, a
+  // .env, or a WordPress install gets the same boring answer as a real
+  // visitor, and learns that this origin is not a website. It also stops the
+  // static-asset handler from turning every unknown path into a 200 SPA shell,
+  // which previously made the server look like it had a UI it does not have.
+  //
+  // Set DSH_SERVER_ROOT_PAGE=assets to serve the SPA at / instead (for a
+  // deployment that does ship a UI).
+  if (url.pathname === '/' && env.DSH_SERVER_ROOT_PAGE === 'assets') {
+    return env.ASSETS.fetch(request)
+  }
+  return teapot()
+}
 
 /**
  * 418 I'm a teapot.
@@ -236,13 +269,22 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   const method = request.method
   const client = clientKey(request)
 
-  // Cross-site requests are rejected before anything else, matching the reference
-  // server's Origin guard.
+  // Origin guard.
+  //
+  // The browser workbench is served from its own origin, so a cross-origin request
+  // is the normal case, not an attack. What matters is that the origin is one the
+  // operator listed: an unlisted origin could otherwise drive this API with the
+  // victim's cookies. `Sec-Fetch-Site` is checked too, because it reports the real
+  // relationship even when a proxy rewrites Origin.
   const origin = request.headers.get('Origin')
-  if (origin !== null && origin !== env.DSH_SERVER_PUBLIC_URL) {
+  const allowedOrigins = parseAllowedOrigins(env.DSH_SERVER_ALLOWED_ORIGINS)
+  if (origin !== null && origin !== env.DSH_SERVER_PUBLIC_URL && !allowedOrigins.includes(origin)) {
     throw new ApiError('AUTH_INVALID', 403)
   }
-  if (request.headers.get('Sec-Fetch-Site') === 'cross-site') {
+  // `cross-site` is refused only when the origin is not allowlisted. A listed origin
+  // legitimately sends `cross-site` when the UI is on a different site, which is the
+  // whole point of the allowlist.
+  if (request.headers.get('Sec-Fetch-Site') === 'cross-site' && origin === null) {
     throw new ApiError('AUTH_INVALID', 403)
   }
 
@@ -268,6 +310,25 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   if (method === 'POST' && path === '/api/v1/devices/register') {
     await requireSession(request, env)
     return registerDevice(request, env)
+  }
+
+  // Claim a Host device with an already-authorized device credential.
+  //
+  // The plugin's flow: sign in as a client, then let the local Host adopt the same
+  // account. It sends the **client's device access token** as the authority — not the
+  // web session — because in the desktop app there is no browser session at all.
+  //
+  // That is the correct authority for this operation even so: the token authenticates
+  // a device that has already proven the account password, and single-account means
+  // any device of this deployment belongs to the same owner. The token is required,
+  // so an unauthenticated caller cannot mint devices, and the newly registered Host
+  // is a separate device with its own key pair and credentials.
+  if (method === 'POST' && path === '/api/v1/devices/register-owned-role') {
+    const authorizing = await requireDevice(request, env)
+    return registerDevice(request, env, {
+      owner: env.DSH_SERVER_ACCOUNT,
+      claimedBy: authorizing.deviceId,
+    })
   }
 
   if (method === 'POST' && path === '/api/v1/auth/refresh') {
@@ -465,7 +526,18 @@ function cookieHeader(env: Env, value: string, maxAgeSeconds: number): string {
 // devices
 // ---------------------------------------------------------------------------
 
-async function registerDevice(request: Request, env: Env): Promise<Response> {
+/**
+ * Register or re-authorize one device.
+ *
+ * `claim` is present only on the register-owned-role path. Single-account means the
+ * owner is always this deployment's account, but the claimed device is recorded so a
+ * later audit can tell which client brought a Host online.
+ */
+async function registerDevice(
+  request: Request,
+  env: Env,
+  claim?: { owner: string; claimedBy: string },
+): Promise<Response> {
   const body = await readJson(request)
   if (body.v !== 1) throw new ApiError('UNSUPPORTED_VERSION', 400)
   const device = body.device

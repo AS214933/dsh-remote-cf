@@ -1,3 +1,9 @@
+<div align="right">
+
+[English](README.md) | **简体中文**
+
+</div>
+
 # dsh-remote-cf
 
 [DSH Remote](https://github.com/AS214933/ds-harness-remote) 服务端的 Cloudflare Workers 移植版。
@@ -64,6 +70,7 @@ npx wrangler deploy
 | `DSH_SERVER_ACCOUNT` | 唯一账号，例如你的邮箱 |
 | `DSH_SERVER_PUBLIC_URL` | 公开 origin，必须和浏览器 origin 完全一致 |
 | `DSH_SERVER_ROOT_PAGE` | 设为 `assets` 时 `/` 返回静态页面；默认返回 418 |
+| `DSH_SERVER_ALLOWED_ORIGINS` | 允许跨域调用 API 的浏览器源，逗号分隔 |
 | `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` | 可选，Cloudflare Realtime TURN |
 | `DSH_SERVER_HEARTBEAT_INTERVAL_MS` | 可选，默认 25000，范围 5000–120000 |
 
@@ -135,6 +142,7 @@ npx vitest run                           # 45 个单元测试
 | `test/data-plane.mjs` | **真实 Noise IK 隧道** 穿过服务端 relay |
 | `test/webrtc-path.mjs` | **真实 WebRTC 数据通道** 经服务端协商 |
 | `test/turn-relay.mjs` | **强制走 TURN**（`iceTransportPolicy: relay`）证明中继可用 |
+| `test/client-flow.mjs` | **插件真实登录流程**，含 Host 认领环节 |
 
 `e2e.mjs` 跑在真实 `wrangler dev` 上而非 mock —— 目的就是把 SQLite 存储、
 alarm 心跳和网关放在真实运行时里一起验证。
