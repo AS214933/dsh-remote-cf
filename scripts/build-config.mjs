@@ -11,8 +11,10 @@ function required(name) {
 }
 const name = required('DSH_BUILD_WORKER_NAME')
 if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) throw new Error('Invalid Worker name')
-const publicUrl = new URL(required('DSH_SERVER_PUBLIC_URL'))
-if (publicUrl.protocol !== 'https:' || publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== '/') {
+let publicUrl
+try { publicUrl = new URL(required('DSH_SERVER_PUBLIC_URL')) }
+catch { throw new Error('DSH_SERVER_PUBLIC_URL must be a valid HTTPS origin (value withheld)') }
+if (publicUrl.protocol !== 'https:' || publicUrl.port || publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== '/') {
   throw new Error('Public URL must be an HTTPS origin')
 }
 const vars = { DSH_SERVER_ACCOUNT: required('DSH_SERVER_ACCOUNT'), DSH_SERVER_PUBLIC_URL: publicUrl.origin }

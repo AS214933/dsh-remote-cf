@@ -7,10 +7,9 @@ import { createManualChecks } from './manual-check.mjs'
  * carried **inside the Noise tunnel**, not gateway frames — the server forwards them
  * as opaque ciphertext and must never parse them.
  *
- * That distinction is the point of this test: it proves the tunnel carries
- * application RPC, and that the server's inability to read it is real rather than
- * assumed. A payload is sent whose plaintext would be trivially recognisable in the
- * server's logs if the ciphertext were ever decoded or the framing broken.
+ * This verifies that matching RPC payloads cross the encrypted relay in both
+ * directions. It checks for literal marker/method leakage in the received frame;
+ * it does not inspect server logs or prove the absence of all decryption paths.
  *
  *   npx tsx rpc-tunnel.mjs <server-url> <email> <password>
  */

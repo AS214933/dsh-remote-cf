@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 import { check, createManualChecks } from './manual-check.mjs'
@@ -39,7 +40,7 @@ describe('manual diagnostic assertions', () => {
     expect(() => checks.ok('old true detail', true)).toThrow('detail must be text')
     expect(() => checks.ok(false, 'conditional title')).toThrow('nonempty string')
     checks.fail('explicit failure', 'guard failed')
-    expect(checks.steps).toEqual([false])
+    expect(checks.steps).toEqual([false, false, false, false])
   })
 
   it('exits nonzero in a fresh process for a false check', () => {
@@ -47,6 +48,22 @@ describe('manual diagnostic assertions', () => {
     expect(failed.error).toBeUndefined()
     expect(failed.status).not.toBe(0)
     expect(failed.stderr).toContain('isolated predicate')
+  })
+
+  it('keeps current manual scripts on the shared strict helpers', () => {
+    for (const name of ['data-plane', 'webrtc-path', 'turn-relay', 'host-connect', 'client-flow',
+      'endpoint-contract', 'rpc-tunnel', 'soak', 'reconnect-race', 'verify-peer-shape', 'e2e']) {
+      const source = readFileSync(new URL(`./${name}.mjs`, import.meta.url), 'utf8')
+      expect(source).toContain("from './manual-check.mjs'")
+      expect(source).not.toMatch(/const\s+ok\s*=/)
+    }
+  })
+
+  it('marks the obsolete OAuth harness noncurrent without a network path', () => {
+    const source = readFileSync(new URL('./oauth-e2e.mjs', import.meta.url), 'utf8')
+    expect(source).toContain('OBSOLETE')
+    expect(source).toContain('process.exitCode = 2')
+    expect(source).not.toMatch(/\bfetch\s*\(/)
   })
 
   it('exits nonzero for wrong predicate types and zero only for true', () => {

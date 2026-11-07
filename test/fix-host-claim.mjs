@@ -64,6 +64,8 @@ if (hostDevice === null) {
 console.log(`host device : ${hostDevice.deviceId}`)
 console.log(`host name   : ${hostDevice.name}`)
 
+let cleanupSession = null
+let helperDeviceId = null
 async function main() {
   // The authorizing credential must be a device token of this account. Sign in and
   // register a client device for that purpose; the Host's own token comes later.
@@ -76,9 +78,10 @@ async function main() {
   const loginBody = await login.json().catch(() => null)
   if (!login.ok || typeof loginBody?.token !== 'string') {
     console.error(`login failed: ${login.status}`)
-    process.exit(1)
+    throw new Error('operation rejected; see nonsecret status above')
   }
-  console.log(`  ok, account=${loginBody.account}`)
+  cleanupSession = loginBody.token
+  console.log('  ok, account session issued')
 
   console.log('\n=== 2. obtain an authorizing device token ===')
   // Reuse the client credentials already on disk when they still work; otherwise
@@ -119,10 +122,11 @@ async function main() {
     const body = await registered.json().catch(() => null)
     if (!registered.ok) {
       console.error(`  client registration failed: ${registered.status}`)
-      process.exit(1)
+      throw new Error('operation rejected; see nonsecret status above')
     }
+    helperDeviceId = deviceId
     authorizingToken = body.accessToken
-    console.log(`  registered helper client ${deviceId}`)
+    console.log('  registered a disposable helper client (will revoke in finally)')
   }
 
   console.log('\n=== 3. register the Host as an owned device ===')
@@ -149,7 +153,7 @@ async function main() {
   const tokens = await claim.json().catch(() => null)
   if (!claim.ok || typeof tokens?.accessToken !== 'string') {
     console.error(`  claim failed: ${claim.status}`)
-    process.exit(1)
+    throw new Error('operation rejected; see nonsecret status above')
   }
   console.log('  ok, access token issued (value withheld)')
 
@@ -182,8 +186,20 @@ async function main() {
     console.log('\nHost is registered and authorized. Restart DSH, then reconnect.')
   } else {
     console.log('\nthe Host token did not resolve to a host device — check the output above')
-    process.exit(1)
+    throw new Error('operation rejected; see nonsecret status above')
   }
 }
 
-main().catch(error => { console.error('failed:', error); process.exit(1) })
+main().catch(error => { console.error('repair failed:', error.message); process.exitCode = 1 }).finally(async () => {
+  if (helperDeviceId === null || cleanupSession === null) return
+  try {
+    const response = await fetch(`${target.origin}/api/v1/account/devices/${encodeURIComponent(helperDeviceId)}`, {
+      method: 'DELETE', headers: { Authorization: `Bearer ${cleanupSession}` }, signal: AbortSignal.timeout(10_000),
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    console.log('Disposable helper client revoked; existing client and Host left intact.')
+  } catch (error) {
+    console.error(`Helper cleanup not confirmed (${error.message}); revoke the helper from the account client before retrying.`)
+    process.exitCode = 1
+  }
+})

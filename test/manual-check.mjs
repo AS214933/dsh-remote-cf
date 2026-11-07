@@ -35,7 +35,11 @@ export function createManualChecks(log = console.log) {
       record(name, true, detail)
     },
     ok(name, detail = '') {
-      validateText(name, detail)
+      try { validateText(name, detail) }
+      catch (error) {
+        record(typeof name === 'string' ? name : 'invalid milestone', false, typeof detail === 'string' ? detail : '')
+        throw error
+      }
       record(name, true, detail)
     },
     fail(name, detail = '') {

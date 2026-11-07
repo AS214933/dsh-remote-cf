@@ -6,6 +6,15 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 const script = fileURLToPath(new URL('../scripts/build-config.mjs', import.meta.url))
 describe('private Workers Builds configuration', () => {
+  it('rejects duplicate and override deployment config flags before Wrangler', () => {
+    const deploy = fileURLToPath(new URL('../scripts/deploy.mjs', import.meta.url))
+    for (const args of [['--config', 'private.local.jsonc', '--config=wrangler.jsonc'], ['--config=wrangler.jsonc'], ['--config', 'private.local.jsonc', '-cwrangler.jsonc'],
+      ['-c', 'a.local.jsonc', '-c', 'b.local.jsonc'], ['--config', '--dry-run']]) {
+      const result = spawnSync(process.execPath, [deploy, ...args], { encoding: 'utf8', env: { ...process.env, DSH_DEPLOY_CONFIG: 'private.local.jsonc' } })
+      expect(result.status).toBe(2)
+      expect(result.stdout).not.toContain('wrangler')
+    }
+  })
   it('generates ignored neutral deployment settings without runtime secret values', () => {
     const cwd = mkdtempSync(path.join(tmpdir(), 'dsh-config-test-'))
     try {
@@ -24,6 +33,18 @@ describe('private Workers Builds configuration', () => {
       expect(text).not.toContain('must-not-copy-runtime-secret')
       expect(run.stdout).not.toContain('remote.example.com')
       expect(run.stdout).not.toContain('owner@example.com')
+    } finally { rmSync(cwd, { recursive: true, force: true }) }
+  })
+  it('does not echo malformed private origins and rejects custom-domain port mismatch', () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), 'dsh-config-test-'))
+    try {
+      for (const value of ['private-sentinel-not-an-origin', 'https://remote.example.com:8443']) {
+        const result = spawnSync(process.execPath, [script], { cwd, encoding: 'utf8', env: { ...process.env,
+          DSH_BUILD_WORKER_NAME: 'test-worker', DSH_SERVER_PUBLIC_URL: value, DSH_SERVER_ACCOUNT: 'owner@example.com',
+        } })
+        expect(result.status).not.toBe(0)
+        expect(result.stderr).not.toContain(value)
+      }
     } finally { rmSync(cwd, { recursive: true, force: true }) }
   })
   it('fails closed if private build identity is missing', () => {
