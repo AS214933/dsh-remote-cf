@@ -21,7 +21,11 @@ hosted deployment a public sign-up service. See [architecture](ARCHITECTURE.md).
    metadata only with consent. Review rewritten refs before any force-push.
 7. Push the verified refs, rescan, and change visibility only after an explicit
    publication decision. Existing clones, forks and cached objects may retain old
-   history; a rewritten branch does not guarantee worldwide erasure.
+   history; a rewritten branch does not guarantee worldwide erasure. Test direct
+   old-SHA access while the repository is still private. GitHub may retain cached
+   commits after a force-push; request support review where applicable, or publish
+   the sanitized history into a new, unrelated repository. Do not assume support
+   will remove ordinary non-sensitive metadata.
 
 ## Git-hosted builds
 
