@@ -59,6 +59,19 @@ export interface Env {
   readonly OAUTH_PROVIDERS?: string
   /** Comma-separated accounts allowed to sign in via OAuth. Defaults to DSH_SERVER_ACCOUNT. */
   readonly OAUTH_ALLOWED_ACCOUNTS?: string
+  /** `application` trusts successful verified-email authentication to this OIDC app; default is explicit email allowlist. */
+  readonly DSH_SERVER_OIDC_ADMISSION?: 'application' | 'allowlist'
+  /** Maximum bound user principals in this deployment, default10 (global resource ceilings still apply). */
+  readonly DSH_SERVER_MAX_TENANTS?: string
+  /** Explicit stable OIDC identity allowed to bind the reserved legacy owner partition. Never inferred from email. */
+  readonly DSH_SERVER_LEGACY_OWNER_SUBJECT?: string
+  readonly DSH_SERVER_LEGACY_OWNER_ISSUER?: string
+  /** Temporary identity-only enrollment gate. Secret capability; never grants legacy devices or a session. */
+  readonly DSH_SERVER_IDENTITY_PROBE_KEY?: string
+  /** Independent operator-only evidence signing Secret. Never included in enrollment URLs. */
+  readonly DSH_SERVER_IDENTITY_EVIDENCE_KEY?: string
+  /** During owner enrollment, reject normal new OIDC sessions while existing device credentials continue. */
+  readonly DSH_SERVER_IDENTITY_ENROLLMENT_ONLY?: string
 
   // --- Cloudflare Realtime TURN (optional; Relay works without it) ---
   readonly TURN_KEY_ID?: string

@@ -55,11 +55,15 @@ export async function timingSafeEqualString(secret: string, left: string, right:
 }
 
 // ---------------------------------------------------------------------------
-// Signed session cookie: stateless, so a Worker request does not have to reach
-// the Durable Object just to validate a web session.
+// Signed session cookie: MAC verification is stateless. The API additionally
+// checks the live tenant registry before authorizing account operations.
 // ---------------------------------------------------------------------------
 
-export interface SessionPayload { account: string; expiresAt: number }
+export interface SessionPayload {
+  account: string; expiresAt: number
+  /** v2 sessions carry an authenticated tenant identity. Legacy values may be decoded only to reject/re-login at the API. */
+  v?: 2; tenantId?: string; issuer?: string; subject?: string
+}
 
 export async function signSession(secret: string, payload: SessionPayload): Promise<string> {
   const body = toBase64Url(encoder.encode(JSON.stringify(payload)))
@@ -81,6 +85,11 @@ export async function verifySession(secret: string, cookie: string, now = Date.n
   const record = parsed as Record<string, unknown>
   if (typeof record.account !== 'string' || typeof record.expiresAt !== 'number') return null
   if (record.expiresAt <= now) return null
+  if (record.v === 2) {
+    if (typeof record.tenantId !== 'string' || record.tenantId.length === 0
+      || typeof record.issuer !== 'string' || typeof record.subject !== 'string') return null
+    return { v: 2, tenantId: record.tenantId, account: record.account, issuer: record.issuer, subject: record.subject, expiresAt: record.expiresAt }
+  }
   return { account: record.account, expiresAt: record.expiresAt }
 }
 

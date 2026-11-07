@@ -9,7 +9,8 @@ import {
 } from '@logto/js'
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from 'jose'
 import type { Env } from './env.js'
-import { toBase64Url } from './crypto.js'
+import { sha256Hex, toBase64Url } from './crypto.js'
+import type { TenantIdentity } from './store.js'
 
 const encoder = new TextEncoder()
 
@@ -168,6 +169,28 @@ export function accountFromClaims(claims: IdTokenClaims): string | null {
   if (claims.email_verified !== true) return null
   const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : ''
   return /^[^\s@\x00-\x1f]+@[^\s@\x00-\x1f]+\.[^\s@\x00-\x1f]+$/.test(email) ? email : null
+}
+
+/**
+ * Derive tenant identity only after verifyIdToken has authenticated the claims.
+ * Email is mutable display/admission data; the namespace must depend on the exact
+ * issuer + subject pair, never on an email address or a request parameter.
+ */
+export async function identityFromClaims(claims: IdTokenClaims): Promise<TenantIdentity | null> {
+  const account = accountFromClaims(claims)
+  if (account === null || typeof claims.iss !== 'string' || typeof claims.sub !== 'string'
+    || claims.iss === '' || claims.sub.trim() === '' || /[\u0000-\u001f\u007f]/.test(claims.sub)) return null
+  try {
+    const issuerUrl = new URL(claims.iss)
+    if (issuerUrl.protocol !== 'https:' || issuerUrl.username || issuerUrl.password
+      || issuerUrl.search || issuerUrl.hash) return null
+  } catch { return null }
+  return {
+    tenantId: await sha256Hex(JSON.stringify(['oidc-v1', claims.iss, claims.sub])),
+    account,
+    issuer: claims.iss,
+    subject: claims.sub,
+  }
 }
 
 export function allowedAccounts(env: Env): string[] {

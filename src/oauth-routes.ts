@@ -16,11 +16,12 @@
  */
 import type { Env } from './env.js'
 import {
-  accountFromClaims, allowedAccounts, buildSignInUrl, callbackUrl, createPkce, exchange,
-  logtoConfig, verifyIdToken,
+  allowedAccounts, buildSignInUrl, callbackUrl, createPkce, exchange,
+  identityFromClaims, logtoConfig, verifyIdToken,
 } from './logto.js'
 import { signState, verifyState, isAllowedReturnTo, stateCookieName } from './oauth.js'
-import { toBase64Url } from './crypto.js'
+import { toBase64Url, timingSafeEqualString } from './crypto.js'
+import type { TenantIdentity, TenantPrincipal } from './store.js'
 
 /** Long enough to scan and authorise, short enough that a leaked code ages out. */
 const SESSION_TTL_SECONDS = 600
@@ -45,7 +46,8 @@ function allowedStartOrigin(request: Request, env: Env): boolean {
 
 export interface OAuthDeps {
   call<T>(method: string, args: unknown[]): Promise<T>
-  issueSession(account: string): Promise<{ token: string; expiresAt: number }>
+  resolveIdentity(identity: TenantIdentity): Promise<TenantPrincipal>
+  issueSession(principal: TenantPrincipal): Promise<{ token: string; expiresAt: number }>
   errorResponse(code: string, status: number, extra?: Record<string, string>): Response
   readJson(request: Request): Promise<Record<string, unknown>>
   rate(key: string, limit: { max: number; windowMs: number }): void
@@ -237,7 +239,14 @@ export async function startRedirect(
   if (config === null) return htmlPage('登录不可用', '<p>尚未配置登录方式。</p>', 503)
 
   const url = new URL(request.url)
-  const requested = url.searchParams.get('return_to') ?? '/app'
+  const requestedProbe = url.searchParams.get('identity_probe')
+  const identityProbe = requestedProbe !== null
+  if (identityProbe && (!env.DSH_SERVER_IDENTITY_PROBE_KEY || !env.DSH_SERVER_IDENTITY_EVIDENCE_KEY
+    || env.DSH_SERVER_IDENTITY_PROBE_KEY === env.DSH_SERVER_IDENTITY_EVIDENCE_KEY
+    || !(await timingSafeEqualString(env.SESSION_SECRET, requestedProbe, env.DSH_SERVER_IDENTITY_PROBE_KEY)))) {
+    return htmlPage('身份核验不可用', '<p>核验入口无效或已关闭。</p>', 403)
+  }
+  const requested = identityProbe ? '/app' : url.searchParams.get('return_to') ?? '/app'
   // Refuse before issuing a state token: an unchecked target would carry the session
   // token to whoever controls it.
   if (!isAllowedReturnTo(requested)) {
@@ -256,6 +265,7 @@ export async function startRedirect(
   const nonce = qrId()
   const state = await signState(env.SESSION_SECRET, {
     providerId: PROVIDER_ID, returnTo: requested, qrId: null, flowId: id, nonce,
+    ...(identityProbe ? { identityProbe: true } : {}),
   })
   const target = await buildSignInUrl(config, {
     redirectUri: callbackUrl(env), state, challenge: pkce.challenge, nonce,
@@ -336,22 +346,53 @@ export async function handleCallback(
     return htmlPage('授权失败', '<p>身份令牌校验未通过。</p>', 502)
   }
 
-  const account = accountFromClaims(claims)
-  if (account === null) {
-    return htmlPage('授权失败', '<p>身份令牌中没有邮箱，请检查 Logto 的 scope 配置。</p>', 502)
+  const identity = await identityFromClaims(claims)
+  if (identity === null) {
+    return htmlPage('授权失败', '<p>身份令牌缺少已验证邮箱或有效的身份标识，请检查 Logto 的配置。</p>', 502)
   }
 
-  // The provider authenticated *someone*; whether that someone may use this deployment
-  // is a separate decision. Without this any Logto account could sign in.
-  if (!allowedAccounts(env).includes(account)) {
+  if (state.identityProbe === true) {
+    // Signed, browser-bound, one-shot enrollment reveals only the authenticated
+    // user's identity. It never creates a tenant, issues a session or grants data.
+    if (!env.DSH_SERVER_IDENTITY_PROBE_KEY || !env.DSH_SERVER_IDENTITY_EVIDENCE_KEY
+      || env.DSH_SERVER_IDENTITY_PROBE_KEY === env.DSH_SERVER_IDENTITY_EVIDENCE_KEY || state.qrId !== null) {
+      return htmlPage('身份核验已关闭', '<p>请重新联系实例维护者。</p>', 403)
+    }
+    const enrollmentFlow = await deps.call<{ provider: string; status: string; expiresAt: number } | null>('getOAuthSession', [flowId])
+    if (enrollmentFlow === null || enrollmentFlow.provider !== PROVIDER_ID || enrollmentFlow.status !== 'exchanging'
+      || enrollmentFlow.expiresAt <= Date.now()) return htmlPage('身份核验已过期', '<p>请重新发起核验。</p>', 410)
+    const evidence = JSON.stringify({ v: 1, ...identity, observedAt: Date.now() })
+    const signature = toBase64Url(await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw',
+      new TextEncoder().encode(env.DSH_SERVER_IDENTITY_EVIDENCE_KEY), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), new TextEncoder().encode(evidence)))
+    // HMAC operations yield too; do not deliver evidence after the flow/state window.
+    const live = await deps.call<{ provider: string; status: string; expiresAt: number } | null>('getOAuthSession', [flowId])
+    if (live === null || live.provider !== PROVIDER_ID || live.status !== 'exchanging'
+      || live.expiresAt <= Date.now() || state.exp * 1000 <= Date.now()) {
+      return htmlPage('身份核验已过期', '<p>请重新发起核验。</p>', 410)
+    }
+    return htmlPage('身份核验完成（未授予设备权限）',
+      `<p>请将下面的核验结果交给实例维护者绑定原账号。此操作没有登录设备池。</p><pre id="identity-evidence">${escapeHtml(JSON.stringify({ evidence, signature }))}</pre>`,
+      200, { 'Set-Cookie': clearStateCookie(env) })
+  }
+  if (env.DSH_SERVER_IDENTITY_ENROLLMENT_ONLY === '1') {
+    return htmlPage('实例正在迁移', '<p>暂未开放新登录；已有设备凭据不受此页面限制。</p>', 503)
+  }
+
+  // Explicit application admission trusts Logto's configured app access policy,
+  // not a server-side role claim. Unset/unknown modes retain the email allowlist.
+  // Both modes still require this app's fully verified ID token and verified email.
+  if (env.DSH_SERVER_OIDC_ADMISSION !== 'application' && !allowedAccounts(env).includes(identity.account)) {
     return htmlPage('账号未获授权', '<p>该账号不在本服务的允许列表内。</p>', 403)
   }
 
-  const session = await deps.issueSession(account)
+  // The registry, not the request/email, supplies the live membership generation.
+  // Resolve before signing so capacity/disabled-member failures cannot issue a session.
+  const principal = await deps.resolveIdentity(identity)
+  const session = await deps.issueSession(principal)
 
   if (state.qrId !== null) {
     const completed = await deps.call<boolean>(
-      'completeOAuthSession', [state.qrId, account, false, session.token],
+      'completeOAuthSession', [state.qrId, principal.account, false, session.token],
     )
     if (!completed) return htmlPage('登录已过期', '<p>二维码会话已失效，请在客户端重新发起登录。</p>', 410)
     return htmlPage('授权完成', '<p>已登录，请回到客户端继续。</p>', 200, {

@@ -1,5 +1,5 @@
 /**
- * The Gateway Durable Object: one instance holds every WebSocket for the account.
+ * The singleton Gateway holds tenant-scoped WebSockets, devices and links.
  *
  * Unlike the reference's long-lived process, this object can hibernate between
  * any two frames. Peers are restored in the constructor; each client's one link
@@ -13,7 +13,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from './env.js'
 import { resolveTiming, resolveTurn, type TimingConfig, type TurnConfig } from './config.js'
-import { Store, StoreError } from './store.js'
+import { Store, StoreError, type TenantIdentity, type TenantPrincipal } from './store.js'
 import { err, fromThrown, ok, type Result } from './result.js'
 import { sha256Hex, randomToken } from './crypto.js'
 import { TurnCredentialCache, type IceServer } from './turn.js'
@@ -31,6 +31,8 @@ type ConnectionState = 'awaiting_hello' | 'authenticated' | 'closing' | 'closed'
 interface Attachment {
   state: ConnectionState
   deviceId?: string
+  /** Trusted tenant from device-token authentication, never supplied by the wire. */
+  tenantId?: string
   role?: 'host' | 'client'
   capabilities?: string[]
   version?: string
@@ -49,6 +51,7 @@ interface Attachment {
 }
 
 interface Link {
+  tenantId: string
   id: string
   host: string
   client: string
@@ -77,6 +80,17 @@ const WEBRTC_FALLBACK_TIMEOUT_MS = 12_000
  */
 export const MAX_PEERS = 256
 export const MAX_LINKS = 256
+export const MAX_TENANT_PEERS = 32
+export const MAX_TENANT_LINKS = 16
+const peerKey = (tenantId: string, deviceId: string): string => JSON.stringify([tenantId, deviceId])
+
+/** Preserve the pre-tenant display membership handle for migrated owner devices. */
+function legacyMembership(account: string): string {
+  let hash = 0
+  const source = `account:${account}`
+  for (let i = 0; i < source.length; i++) hash = (Math.imul(hash, 31) + source.charCodeAt(i)) >>> 0
+  return `account:${hash.toString(16).padStart(8, '0')}`
+}
 /** Drop a slow consumer past this much in flight, mirroring `bufferedAmount > 4 MiB`. */
 const MAX_BUFFERED_BYTES = 4 * MAX_RELAY_FRAME_BYTES
 const LINK_PENDING_TIMEOUT_MS = 30_000
@@ -103,9 +117,16 @@ export class Gateway extends DurableObject<Env> {
   private readonly store: Store
   private readonly turnCredentials: TurnCredentialCache
 
-  /** deviceId -> socket. In memory; rebuilt from attachments after a restart. */
+  /** JSON [tenantId, deviceId] -> socket; restored only from tenant-bound attachments. */
   private readonly peers = new Map<string, WebSocket>()
   private readonly links = new Map<string, Link>()
+  /** Guards credential issuance across async hashes; pending events cannot hibernate mid-flight. */
+  private readonly credentialEpoch = new Map<string, number>()
+  private bumpCredentialEpoch(tenantId: string, deviceId: string): number {
+    const key = peerKey(tenantId, deviceId), next = (this.credentialEpoch.get(key) ?? 0) + 1
+    this.credentialEpoch.set(key, next)
+    return next
+  }
   /** Bytes queued but not yet flushed per socket, standing in for `bufferedAmount`. */
   private readonly pending = new WeakMap<WebSocket, number>()
 
@@ -118,31 +139,45 @@ export class Gateway extends DurableObject<Env> {
     // so this happens once per cold start, not per request — re-running them on
     // every access was a needless source of SQLite lock contention.
     this.store = new Store(ctx.storage)
+    this.store.ensureLegacyTenant(env.DSH_SERVER_ACCOUNT, legacyMembership(env.DSH_SERVER_ACCOUNT))
     this.restoreConnections()
   }
 
-  /** Rebuild before any message, RPC or alarm, not only when a heartbeat happens. */
+  private peer(tenantId: string, deviceId: string): WebSocket | undefined {
+    return this.peers.get(peerKey(tenantId, deviceId))
+  }
+
+  /** Rebuild only explicitly tenant-bound attachments. Legacy sockets must re-hello. */
   private restoreConnections(): void {
-    const sockets = this.ctx.getWebSockets()
-    for (const socket of sockets) {
+    for (const socket of this.ctx.getWebSockets()) {
       const attachment = (socket.deserializeAttachment() ?? {}) as Attachment
-      // A close/error can itself wake the object. Keep its identity long enough
-      // to restore then tear down its links; filtering it out first loses cleanup.
-      if (attachment.state !== 'authenticated' || attachment.deviceId === undefined) continue
-      if (attachment.sessionId === undefined) {
-        attachment.sessionId = crypto.randomUUID()
-        socket.serializeAttachment(attachment)
+      if (attachment.state !== 'authenticated') continue
+      const { tenantId, deviceId } = attachment
+      if (typeof tenantId !== 'string' || typeof deviceId !== 'string' || !attachment.sessionId
+        || this.store.getTenant(tenantId) === null) {
+        this.closeQuietly(socket, 'AUTH_INVALID')
+        continue
       }
-      this.peers.set(attachment.deviceId, socket)
+      const device = this.store.getDevice(tenantId, deviceId)
+      const key = peerKey(tenantId, deviceId)
+      if (device === null || device.revoked !== 0 || device.role !== attachment.role || this.peers.has(key) || this.peers.size >= MAX_PEERS
+        || [...this.peers.values()].filter(peer => (peer.deserializeAttachment() as Attachment).tenantId === tenantId).length >= MAX_TENANT_PEERS) {
+        this.closeQuietly(socket, 'AUTH_INVALID')
+        continue
+      }
+      this.peers.set(key, socket)
     }
     for (const socket of this.peers.values()) {
       const attachment = socket.deserializeAttachment() as Attachment
       const saved = attachment.link
       if (attachment.role !== 'client' || saved === undefined) continue
-      const host = this.peers.get(saved.host)
+      const host = typeof saved.tenantId === 'string' ? this.peer(saved.tenantId, saved.host) : undefined
       const hostAttachment = host?.deserializeAttachment() as Attachment | undefined
-      if (saved.client !== attachment.deviceId || saved.clientSessionId !== attachment.sessionId
-        || hostAttachment?.sessionId !== saved.hostSessionId) {
+      if (saved.tenantId !== attachment.tenantId || saved.client !== attachment.deviceId
+        || saved.clientSessionId !== attachment.sessionId || hostAttachment?.tenantId !== attachment.tenantId
+        || hostAttachment?.role !== 'host' || hostAttachment.sessionId !== saved.hostSessionId
+        || this.links.has(saved.id) || this.links.size >= MAX_LINKS
+        || [...this.links.values()].filter(link => link.tenantId === saved.tenantId).length >= MAX_TENANT_LINKS) {
         delete attachment.link
         socket.serializeAttachment(attachment)
         continue
@@ -153,12 +188,13 @@ export class Gateway extends DurableObject<Env> {
 
   /** Attach a bounded snapshot to the client before forwarding a state transition. */
   private saveLink(link: Link): void {
-    const client = this.peers.get(link.client)
-    const host = this.peers.get(link.host)
+    const client = this.peer(link.tenantId, link.client)
+    const host = this.peer(link.tenantId, link.host)
     if (client === undefined || host === undefined) return
     const attachment = client.deserializeAttachment() as Attachment
     const hostAttachment = host.deserializeAttachment() as Attachment
-    if (attachment.sessionId === undefined || hostAttachment.sessionId === undefined) return
+    if (attachment.sessionId === undefined || hostAttachment.sessionId === undefined
+      || attachment.tenantId !== link.tenantId || hostAttachment.tenantId !== link.tenantId) return
     attachment.link = { ...link, counters: [...link.counters],
       hostSessionId: hostAttachment.sessionId, clientSessionId: attachment.sessionId }
     client.serializeAttachment(attachment)
@@ -166,7 +202,7 @@ export class Gateway extends DurableObject<Env> {
 
   private forgetLink(link: Link): void {
     this.links.delete(link.id)
-    const client = this.peers.get(link.client)
+    const client = this.peer(link.tenantId, link.client)
     if (client === undefined) return
     const attachment = client.deserializeAttachment() as Attachment
     if (attachment.link?.id === link.id) {
@@ -264,19 +300,19 @@ export class Gateway extends DurableObject<Env> {
 
     // Authenticated. Re-validate that this socket is still the registered peer:
     // a replaced connection must not keep acting on the old identity.
-    const peer = attachment.deviceId === undefined ? undefined : this.peers.get(attachment.deviceId)
-    if (attachment.deviceId === undefined || peer !== ws) {
+    const peer = attachment.deviceId === undefined || attachment.tenantId === undefined ? undefined : this.peer(attachment.tenantId, attachment.deviceId)
+    if (attachment.deviceId === undefined || attachment.tenantId === undefined || peer !== ws || this.store.getTenant(attachment.tenantId) === null) {
       this.fail(ws, 'AUTH_INVALID')
       return
     }
-    const device = this.store.getDevice(attachment.deviceId)
-    if (device === null || device.revoked !== 0) {
+    const device = this.store.getDevice(attachment.tenantId, attachment.deviceId)
+    if (device === null || device.revoked !== 0 || device.role !== attachment.role) {
       this.fail(ws, 'AUTH_INVALID')
       return
     }
 
     try {
-      this.handleAuthenticated(ws, attachment as Required<Pick<Attachment, 'deviceId' | 'role' | 'capabilities' | 'version'>> & Attachment, frame)
+      this.handleAuthenticated(ws, attachment as Required<Pick<Attachment, 'tenantId' | 'deviceId' | 'role' | 'capabilities' | 'version'>> & Attachment, frame)
     } catch (error) {
       const code = error instanceof ProtocolError || error instanceof StoreError ? error.code : 'INVALID_MESSAGE'
       this.failLinkOrPeer(ws, attachment, frame, code)
@@ -285,8 +321,8 @@ export class Gateway extends DurableObject<Env> {
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-    if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
-      this.dropPeer(attachment.deviceId, 'CONNECTION_FAILED')
+    if (attachment.tenantId !== undefined && attachment.deviceId !== undefined && this.peer(attachment.tenantId, attachment.deviceId) === ws) {
+      this.dropPeer(attachment.tenantId, attachment.deviceId, 'CONNECTION_FAILED')
     }
     // The runtime completes the close handshake on its own (compat date >= 2026-04-07).
     void code
@@ -295,8 +331,8 @@ export class Gateway extends DurableObject<Env> {
 
   override async webSocketError(ws: WebSocket): Promise<void> {
     const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-    if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
-      this.dropPeer(attachment.deviceId, 'CONNECTION_FAILED')
+    if (attachment.tenantId !== undefined && attachment.deviceId !== undefined && this.peer(attachment.tenantId, attachment.deviceId) === ws) {
+      this.dropPeer(attachment.tenantId, attachment.deviceId, 'CONNECTION_FAILED')
     } else this.closeQuietly(ws, 'CONNECTION_FAILED')
   }
 
@@ -348,7 +384,9 @@ export class Gateway extends DurableObject<Env> {
       return
     }
 
-    const device = this.store.getDevice(hello.deviceId)
+    const tenant = this.store.getTenant(token.tenant_id)
+    if (tenant === null) { this.fail(ws, 'AUTH_INVALID'); return }
+    const device = this.store.getDevice(token.tenant_id, hello.deviceId)
     if (device === null) {
       console.warn('hello rejected: device not registered', { deviceId: hello.deviceId, role: hello.role })
       this.fail(ws, 'AUTH_INVALID')
@@ -377,10 +415,14 @@ export class Gateway extends DurableObject<Env> {
 
     // Match the reference: close only the predecessor with 4003. A time-based
     // heuristic cannot identify an instance and makes two clients fight to reconnect.
-    const previous = this.peers.get(hello.deviceId)
-    if (previous !== undefined && previous !== ws) this.disconnect(hello.deviceId, 'CONNECTION_REPLACED')
+    const previous = this.peer(tenant.tenantId, hello.deviceId)
+    if (previous === undefined && [...this.peers.values()].filter(peer => (peer.deserializeAttachment() as Attachment).tenantId === tenant.tenantId).length >= MAX_TENANT_PEERS) {
+      this.fail(ws, 'RATE_LIMITED'); return
+    }
+    if (previous !== undefined && previous !== ws) this.disconnect(tenant.tenantId, hello.deviceId, 'CONNECTION_REPLACED')
 
     attachment.state = 'authenticated'
+    attachment.tenantId = tenant.tenantId
     attachment.deviceId = hello.deviceId
     attachment.role = hello.role
     attachment.capabilities = this.negotiatedCapabilities(hello.capabilities)
@@ -391,8 +433,8 @@ export class Gateway extends DurableObject<Env> {
     delete attachment.helloDeadline
     ws.serializeAttachment(attachment)
 
-    this.peers.set(hello.deviceId, ws)
-    this.store.touchDevice(hello.deviceId, hello.clientVersion, hello.harnessVersion)
+    this.peers.set(peerKey(tenant.tenantId, hello.deviceId), ws)
+    this.store.touchDevice(tenant.tenantId, hello.deviceId, hello.clientVersion, hello.harnessVersion)
 
     this.send(ws, createControlFrame('hello.ack', {
       protocol: 1,
@@ -422,7 +464,7 @@ export class Gateway extends DurableObject<Env> {
 
   private handleAuthenticated(
     ws: WebSocket,
-    attachment: Attachment & { deviceId: string; role: 'host' | 'client'; capabilities: string[]; version: string },
+    attachment: Attachment & { tenantId: string; deviceId: string; role: 'host' | 'client'; capabilities: string[]; version: string },
     frame: ControlFrame,
   ): void {
     if (frame.type === 'hello') throw new ProtocolError('INVALID_MESSAGE')
@@ -456,12 +498,12 @@ export class Gateway extends DurableObject<Env> {
     // Everything below is scoped to one existing link.
     const target = parseTarget(frame.payload)
     const link = this.links.get(target.connectionId)
-    if (link === undefined) throw new ProtocolError('CONNECTION_NOT_FOUND')
+    if (link === undefined || link.tenantId !== attachment.tenantId) throw new ProtocolError('CONNECTION_NOT_FOUND')
     if (attachment.deviceId !== link.host && attachment.deviceId !== link.client) {
       throw new ProtocolError('CONNECTION_NOT_FOUND')
     }
     const otherId = attachment.deviceId === link.host ? link.client : link.host
-    const other = this.peers.get(otherId)
+    const other = this.peer(link.tenantId, otherId)
     if (other === undefined) throw new ProtocolError('CONNECTION_FAILED')
     if (target.targetDeviceId !== otherId) throw new ProtocolError('INVALID_MESSAGE')
 
@@ -520,17 +562,17 @@ export class Gateway extends DurableObject<Env> {
    * server already dropped.
    */
   private handleConnectAnswer(
-    attachment: Attachment & { deviceId: string; role: 'host' | 'client' },
+    attachment: Attachment & { tenantId: string; deviceId: string; role: 'host' | 'client' },
     frame: ControlFrame,
   ): void {
     const connectionId = frame.payload.connectionId
     if (typeof connectionId !== 'string' || connectionId === '') throw new ProtocolError('INVALID_MESSAGE')
     const link = this.links.get(connectionId)
-    if (link === undefined) throw new ProtocolError('CONNECTION_NOT_FOUND')
+    if (link === undefined || link.tenantId !== attachment.tenantId) throw new ProtocolError('CONNECTION_NOT_FOUND')
     if (attachment.deviceId !== link.host) throw new ProtocolError('INVALID_MESSAGE')
     if (link.stage !== 'pending') throw new ProtocolError('INVALID_MESSAGE')
 
-    const clientSocket = this.peers.get(link.client)
+    const clientSocket = this.peer(link.tenantId, link.client)
     if (frame.type === 'connect.rejected') {
       this.forgetLink(link)
       if (clientSocket !== undefined) this.send(clientSocket, frame)
@@ -545,23 +587,23 @@ export class Gateway extends DurableObject<Env> {
     // creates its offer, so the Host's later lookup does not add another mint
     // round trip. Do not await this or gate signaling/hibernation on a timer.
     if (link.preferredTransports.some(transport => transport !== 'relay') && this.turnEnabled
-      && this.turnLink(link.client, link.id) === link) {
+      && this.turnLink(link.tenantId, link.client, link.id) === link) {
       this.ctx.waitUntil(Promise.all([
-        this.turnCredentials.get(link.client), this.turnCredentials.get(link.host),
+        this.turnCredentials.get(peerKey(link.tenantId, link.client)), this.turnCredentials.get(peerKey(link.tenantId, link.host)),
       ]).then(() => undefined))
     }
   }
 
   private handleConnectRequest(
     ws: WebSocket,
-    attachment: Attachment & { deviceId: string; role: 'host' | 'client'; capabilities: string[]; version: string },
+    attachment: Attachment & { tenantId: string; deviceId: string; role: 'host' | 'client'; capabilities: string[]; version: string },
     frame: ControlFrame,
   ): void {
     if (attachment.role !== 'client') throw new ProtocolError('MEMBERSHIP_REQUIRED')
     const request = parseConnectRequest(frame.payload)
 
-    const hostSocket = this.peers.get(request.hostDeviceId)
-    const hostDevice = this.store.getDevice(request.hostDeviceId)
+    const hostSocket = this.peer(attachment.tenantId, request.hostDeviceId)
+    const hostDevice = this.store.getDevice(attachment.tenantId, request.hostDeviceId)
     if (hostSocket === undefined || hostDevice === null || hostDevice.role !== 'host' || hostDevice.revoked !== 0) {
       this.send(ws, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true }))
       return
@@ -594,7 +636,7 @@ export class Gateway extends DurableObject<Env> {
     const hostVersion = hostAttachment.version ?? hostDevice.client_version
     const concurrentAllowed = this.env.DSH_SERVER_ALLOW_CONCURRENT_HOSTS === '1' || modernHost(hostVersion)
     for (const old of [...this.links.values()]) {
-      if (old.client === attachment.deviceId || (old.host === request.hostDeviceId && !concurrentAllowed)) {
+      if (old.tenantId === attachment.tenantId && (old.client === attachment.deviceId || (old.host === request.hostDeviceId && !concurrentAllowed))) {
         console.warn('dropping link for a new connection', {
           linkId: old.id, host: old.host, client: old.client,
           reason: old.client === attachment.deviceId ? 'same client' : 'legacy host, one link only',
@@ -603,9 +645,10 @@ export class Gateway extends DurableObject<Env> {
         this.dropLink(old, 'CONNECTION_REPLACED')
       }
     }
-    if (this.links.size >= MAX_LINKS) throw new ProtocolError('RATE_LIMITED')
+    if (this.links.size >= MAX_LINKS || [...this.links.values()].filter(link => link.tenantId === attachment.tenantId).length >= MAX_TENANT_LINKS) throw new ProtocolError('RATE_LIMITED')
 
     const link: Link = {
+      tenantId: attachment.tenantId,
       id: crypto.randomUUID(),
       host: request.hostDeviceId,
       client: attachment.deviceId,
@@ -622,7 +665,7 @@ export class Gateway extends DurableObject<Env> {
     this.send(hostSocket, createControlFrame('connect.incoming', {
       connectionId: link.id,
       clientDeviceId: attachment.deviceId,
-      clientIdentityKey: this.store.getDevice(attachment.deviceId)?.identity_key,
+      clientIdentityKey: this.store.getDevice(attachment.tenantId, attachment.deviceId)?.identity_key,
       authorization: 'account',
       preferredTransports: link.preferredTransports,
     }))
@@ -649,7 +692,7 @@ export class Gateway extends DurableObject<Env> {
    */
   private forwardTransportSelected(
     link: Link,
-    sender: Attachment & { deviceId: string },
+    sender: Attachment & { tenantId: string; deviceId: string },
     other: WebSocket,
     frame: ControlFrame,
   ): void {
@@ -680,7 +723,7 @@ export class Gateway extends DurableObject<Env> {
   }
 
   private forwardSignal(
-    link: Link, sender: Attachment & { deviceId: string }, other: WebSocket, frame: ControlFrame,
+    link: Link, sender: Attachment & { tenantId: string; deviceId: string }, other: WebSocket, frame: ControlFrame,
   ): void {
     if (link.stage === 'ready') {
       console.warn('dropped signaling after the link became ready', { linkId: link.id, type: frame.type })
@@ -715,10 +758,13 @@ export class Gateway extends DurableObject<Env> {
         this.fail(socket, 'AUTH_REQUIRED')
       }
     }
-    for (const [deviceId, socket] of this.peers) {
+    for (const socket of this.peers.values()) {
       const attachment = (socket.deserializeAttachment() ?? {}) as Attachment
+      if (!attachment.tenantId || !attachment.deviceId || this.store.getTenant(attachment.tenantId) === null) {
+        this.fail(socket, 'AUTH_INVALID'); continue
+      }
       if (now - (attachment.lastPong ?? 0) > heartbeatDisconnectMs) {
-        this.dropPeer(deviceId, 'CONNECTION_FAILED')
+        this.dropPeer(attachment.tenantId, attachment.deviceId, 'CONNECTION_FAILED')
         continue
       }
       if (now < (attachment.nextPingAt ?? 0)) continue
@@ -768,21 +814,21 @@ export class Gateway extends DurableObject<Env> {
   // teardown helpers
   // -------------------------------------------------------------------------
 
-  private dropPeer(deviceId: string, code: string): void {
-    const socket = this.peers.get(deviceId)
+  private dropPeer(tenantId: string, deviceId: string, code: string): void {
+    const socket = this.peer(tenantId, deviceId)
     for (const link of [...this.links.values()]) {
-      if (link.host === deviceId || link.client === deviceId) this.dropLink(link, code)
+      if (link.tenantId === tenantId && (link.host === deviceId || link.client === deviceId)) this.dropLink(link, code)
     }
-    this.peers.delete(deviceId)
+    this.peers.delete(peerKey(tenantId, deviceId))
     if (socket !== undefined) this.closeQuietly(socket, code)
   }
 
-  private disconnect(deviceId: string, code: string): void { this.dropPeer(deviceId, code) }
+  private disconnect(tenantId: string, deviceId: string, code: string): void { this.dropPeer(tenantId, deviceId, code) }
 
   private dropLink(link: Link, code: string): void {
     this.forgetLink(link)
     for (const id of [link.host, link.client]) {
-      const socket = this.peers.get(id)
+      const socket = this.peer(link.tenantId, id)
       if (socket === undefined) continue
       const attachment = (socket.deserializeAttachment() ?? {}) as Attachment
       // Old hosts predate the connection-scoped error frame; only send it to
@@ -795,11 +841,11 @@ export class Gateway extends DurableObject<Env> {
 
   private fail(ws: WebSocket, code: string): void {
     const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-    if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
+    if (attachment.tenantId !== undefined && attachment.deviceId !== undefined && this.peer(attachment.tenantId, attachment.deviceId) === ws) {
       for (const link of [...this.links.values()]) {
-        if (link.host === attachment.deviceId || link.client === attachment.deviceId) this.dropLink(link, code)
+        if (link.tenantId === attachment.tenantId && (link.host === attachment.deviceId || link.client === attachment.deviceId)) this.dropLink(link, code)
       }
-      this.peers.delete(attachment.deviceId)
+      this.peers.delete(peerKey(attachment.tenantId, attachment.deviceId))
     }
     this.closeQuietly(ws, code, createControlFrame('error', { code, message: code, retryable: false }))
   }
@@ -812,7 +858,7 @@ export class Gateway extends DurableObject<Env> {
     const connectionId = (frame.payload as { connectionId?: unknown }).connectionId
     if (typeof connectionId === 'string' && code !== 'RATE_LIMITED') {
       const link = this.links.get(connectionId)
-      if (link !== undefined && (link.host === attachment.deviceId || link.client === attachment.deviceId)) {
+      if (link !== undefined && link.tenantId === attachment.tenantId && (link.host === attachment.deviceId || link.client === attachment.deviceId)) {
         this.dropLink(link, code)
         return
       }
@@ -852,8 +898,8 @@ export class Gateway extends DurableObject<Env> {
     const queued = this.pending.get(ws) ?? 0
     if (queued + payload.length > MAX_BUFFERED_BYTES) {
       const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-      if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
-        this.dropPeer(attachment.deviceId, 'SLOW_CONSUMER')
+      if (attachment.tenantId !== undefined && attachment.deviceId !== undefined && this.peer(attachment.tenantId, attachment.deviceId) === ws) {
+        this.dropPeer(attachment.tenantId, attachment.deviceId, 'SLOW_CONSUMER')
       }
       return
     }
@@ -868,8 +914,8 @@ export class Gateway extends DurableObject<Env> {
       }, 100)
     } catch {
       const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-      if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
-        this.dropPeer(attachment.deviceId, 'CONNECTION_FAILED')
+      if (attachment.tenantId !== undefined && attachment.deviceId !== undefined && this.peer(attachment.tenantId, attachment.deviceId) === ws) {
+        this.dropPeer(attachment.tenantId, attachment.deviceId, 'CONNECTION_FAILED')
       }
     }
   }
@@ -879,13 +925,14 @@ export class Gateway extends DurableObject<Env> {
   // -------------------------------------------------------------------------
 
   /** Register a device and issue its first credential pair. */
-  async registerDevice(input: {
+  async registerDevice(tenantId: string, input: {
     deviceId: string; role: 'host' | 'client'; name: string; platform: string
     identityKey: string; clientVersion: string; harnessVersion?: string
   }): Promise<Result<{ accessToken: string; refreshToken: string; accessTokenExpiresAt: number; refreshTokenExpiresAt: number }>> {
     try {
+      if (this.store.getTenant(tenantId) === null) return err('AUTH_INVALID', 401)
       this.store.purgeExpiredTokens()
-      const { created } = this.store.upsertDevice({
+      const { created } = this.store.upsertDevice(tenantId, {
         device_id: input.deviceId,
         role: input.role,
         name: input.name,
@@ -896,26 +943,33 @@ export class Gateway extends DurableObject<Env> {
       })
       // Re-registering a device invalidates its old tokens, so a revoked credential
       // cannot be resurrected by re-registering.
-      this.store.deleteTokensFor(input.deviceId)
-      this.turnCredentials.forget(input.deviceId)
-      if (created) this.store.touchDevice(input.deviceId)
-      return ok(await this.issueTokens(input.deviceId))
+      const epoch = this.bumpCredentialEpoch(tenantId, input.deviceId)
+      this.store.deleteTokensFor(tenantId, input.deviceId)
+      this.turnCredentials.forget(peerKey(tenantId, input.deviceId))
+      if (created) this.store.touchDevice(tenantId, input.deviceId)
+      return ok(await this.issueTokens(tenantId, input.deviceId, epoch))
     } catch (error) { return fromThrown(error) }
   }
 
   /** Issue a fresh token pair, computing digests off the synchronous SQL path. */
-  async issueTokens(deviceId: string): Promise<{
+  private async issueTokens(tenantId: string, deviceId: string, epoch: number): Promise<{
     accessToken: string; refreshToken: string; accessTokenExpiresAt: number; refreshTokenExpiresAt: number
   }> {
     const { LIMITS } = await import('./store.js')
     this.store.purgeExpiredTokens()
-    if (this.store.countTokens() >= LIMITS.tokens) throw new StoreError('RATE_LIMITED', 429)
+    if (this.store.getTenant(tenantId) === null || this.store.getDevice(tenantId, deviceId)?.revoked !== 0) throw new StoreError('AUTH_INVALID', 401)
+    if (this.store.countTokens(tenantId) + 2 > LIMITS.tokens) throw new StoreError('RATE_LIMITED', 429)
     const accessToken = randomToken()
     const refreshToken = randomToken()
     const accessTokenExpiresAt = Date.now() + LIMITS.accessTokenMs
     const refreshTokenExpiresAt = Date.now() + LIMITS.refreshTokenMs
-    this.store.insertToken(await sha256Hex(accessToken), deviceId, 'access', accessTokenExpiresAt)
-    this.store.insertToken(await sha256Hex(refreshToken), deviceId, 'refresh', refreshTokenExpiresAt)
+    const [accessDigest, refreshDigest] = await Promise.all([sha256Hex(accessToken), sha256Hex(refreshToken)])
+    // Hashing yields; re-registration/rotation owns a new credential generation.
+    if (this.credentialEpoch.get(peerKey(tenantId, deviceId)) !== epoch) throw new StoreError('AUTH_INVALID', 401)
+    if (this.store.getTenant(tenantId) === null || this.store.getDevice(tenantId, deviceId)?.revoked !== 0) throw new StoreError('AUTH_INVALID', 401)
+    if (this.store.countTokens(tenantId) + 2 > LIMITS.tokens) throw new StoreError('RATE_LIMITED', 429)
+    this.store.insertToken(accessDigest, tenantId, deviceId, 'access', accessTokenExpiresAt)
+    this.store.insertToken(refreshDigest, tenantId, deviceId, 'refresh', refreshTokenExpiresAt)
     return { accessToken, refreshToken, accessTokenExpiresAt, refreshTokenExpiresAt }
   }
 
@@ -924,31 +978,33 @@ export class Gateway extends DurableObject<Env> {
     accessToken: string; refreshToken: string; accessTokenExpiresAt: number; refreshTokenExpiresAt: number
   }>> {
     try {
-      const device = this.store.getDevice(deviceId)
-      if (device === null) return err('DEVICE_NOT_FOUND', 404)
-      if (device.revoked !== 0) return err('DEVICE_REVOKED', 403)
       const digest = await sha256Hex(refreshToken)
       const record = this.store.findToken(digest)
-      if (record === null || record.kind !== 'refresh' || record.device_id !== deviceId) {
-        return err('AUTH_INVALID', 401)
-      }
+      if (record === null || record.kind !== 'refresh' || record.device_id !== deviceId) return err('AUTH_INVALID', 401)
+      const tenantId = record.tenant_id
+      if (this.store.getTenant(tenantId) === null) return err('AUTH_INVALID', 401)
+      const device = this.store.getDevice(tenantId, deviceId)
+      if (device === null) return err('AUTH_INVALID', 401)
+      if (device.revoked !== 0) return err('DEVICE_REVOKED', 403)
       if (record.expires_at <= Date.now()) return err('TOKEN_EXPIRED', 401)
       if (record.used !== 0) {
-        // A reused refresh token means the previous response was intercepted or
-        // replayed. Revoke the whole device rather than hand out a new pair.
-        this.store.revokeDevice(deviceId)
-        this.turnCredentials.forget(deviceId)
-        this.dropPeer(deviceId, 'AUTH_INVALID')
+        this.store.revokeDevice(tenantId, deviceId)
+        this.turnCredentials.forget(peerKey(tenantId, deviceId))
+        this.dropPeer(tenantId, deviceId, 'AUTH_INVALID')
         return err('AUTH_INVALID', 401)
       }
+      const epoch = this.bumpCredentialEpoch(tenantId, deviceId)
       this.store.markTokenUsed(digest)
-      this.store.deleteTokensFor(deviceId)
-      return ok(await this.issueTokens(deviceId))
+      // Keep used refresh digests until their original expiry. Otherwise deleting
+      // the marker would turn reuse into a harmless not-found and leave new tokens live.
+      this.store.deleteTokensFor(tenantId, deviceId, true)
+      return ok(await this.issueTokens(tenantId, deviceId, epoch))
     } catch (error) { return fromThrown(error) }
   }
 
   /** Synchronous so authorization can be checked again after an upstream await. */
   private authenticateDigest(digest: string): Result<{
+    tenantId: string; account: string; membershipId: string
     deviceId: string; role: 'host' | 'client'; name: string; platform: string
     identityKey: string; clientVersion: string; harnessVersion: string | null
     revoked: boolean; lastSeenAt: number; online: boolean
@@ -956,14 +1012,17 @@ export class Gateway extends DurableObject<Env> {
     const record = this.store.findToken(digest)
     if (record === null || record.kind !== 'access') return err('AUTH_INVALID', 401)
     if (record.expires_at <= Date.now()) return err('TOKEN_EXPIRED', 401)
-    const device = this.store.getDevice(record.device_id)
+    const tenant = this.store.getTenant(record.tenant_id)
+    if (tenant === null) return err('AUTH_INVALID', 401)
+    const device = this.store.getDevice(record.tenant_id, record.device_id)
     if (device === null) return err('DEVICE_NOT_FOUND', 404)
     if (device.revoked !== 0) return err('DEVICE_REVOKED', 403)
     return ok({
+      tenantId: tenant.tenantId, account: tenant.account, membershipId: tenant.membershipId,
       deviceId: device.device_id, role: device.role, name: device.name, platform: device.platform,
       identityKey: device.identity_key, clientVersion: device.client_version,
       harnessVersion: device.harness_version, revoked: false, lastSeenAt: device.last_seen_at,
-      online: this.peers.has(device.device_id),
+      online: this.peers.has(peerKey(tenant.tenantId, device.device_id)),
     })
   }
 
@@ -978,7 +1037,7 @@ export class Gateway extends DurableObject<Env> {
     try {
       const source = this.authenticateDigest(await sha256Hex(accessToken))
       if (!source.ok) return source
-      const target = this.deviceSummary(targetId)
+      const target = this.deviceSummary(source.value.tenantId, targetId)
       if (target === null) return err('DEVICE_NOT_FOUND', 404)
       if (source.value.role === target.role) return err('MEMBERSHIP_REQUIRED', 403)
       return ok(target)
@@ -991,14 +1050,14 @@ export class Gateway extends DurableObject<Env> {
       const digest = await sha256Hex(accessToken)
       const source = this.authenticateDigest(digest)
       if (!source.ok) return source
-      const link = this.turnLink(source.value.deviceId, connectionId)
+      const link = this.turnLink(source.value.tenantId, source.value.deviceId, connectionId)
       if (link === undefined) return err('CONNECTION_NOT_FOUND', 404)
-      const servers = await this.turnCredentials.get(source.value.deviceId)
+      const servers = await this.turnCredentials.get(peerKey(source.value.tenantId, source.value.deviceId))
       // Minting yields. A revoke, refresh, close, replacement or deadline may
       // have invalidated the caller meanwhile. No further await after this check.
       const current = this.authenticateDigest(digest)
       if (!current.ok) return current
-      if (this.turnLink(current.value.deviceId, connectionId) !== link) return err('CONNECTION_NOT_FOUND', 404)
+      if (this.turnLink(current.value.tenantId, current.value.deviceId, connectionId) !== link) return err('CONNECTION_NOT_FOUND', 404)
       return ok(servers ?? [])
     } catch (error) { return fromThrown(error) }
   }
@@ -1010,11 +1069,15 @@ export class Gateway extends DurableObject<Env> {
    * single-peer response needs it (the client validates and pins it), the list
    * response must not carry it.
    */
-  async listDevices(): Promise<Array<{
+  async listDevices(tenantId: string): Promise<Array<{
+    tenantId: string; membershipId: string
     deviceId: string; role: string; name: string; platform: string; clientVersion: string
     identityKey: string; harnessVersion: string | null; lastSeenAt: number; online: boolean
   }>> {
-    return this.store.listDevices().map(device => ({
+    const principal = this.store.getTenant(tenantId)
+    if (principal === null) return []
+    return this.store.listDevices(tenantId).map(device => ({
+      tenantId, membershipId: principal.membershipId,
       deviceId: device.device_id,
       role: device.role,
       name: device.name,
@@ -1023,51 +1086,73 @@ export class Gateway extends DurableObject<Env> {
       identityKey: device.identity_key,
       harnessVersion: device.harness_version,
       lastSeenAt: device.last_seen_at,
-      online: this.peers.has(device.device_id),
+      online: this.peers.has(peerKey(tenantId, device.device_id)),
     }))
   }
 
-  async getDevice(deviceId: string) { return this.deviceSummary(deviceId) }
+  async getDevice(tenantId: string, deviceId: string) { return this.deviceSummary(tenantId, deviceId) }
 
-  private deviceSummary(deviceId: string) {
-    const device = this.store.getDevice(deviceId)
+  private deviceSummary(tenantId: string, deviceId: string) {
+    const principal = this.store.getTenant(tenantId)
+    if (principal === null) return null
+    const device = this.store.getDevice(tenantId, deviceId)
     if (device === null || device.revoked !== 0) return null
     return {
+      tenantId, membershipId: principal.membershipId,
       deviceId: device.device_id, role: device.role, name: device.name, platform: device.platform,
       identityKey: device.identity_key, clientVersion: device.client_version,
       harnessVersion: device.harness_version, lastSeenAt: device.last_seen_at,
-      online: this.peers.has(device.device_id),
+      online: this.peers.has(peerKey(tenantId, device.device_id)),
     }
   }
 
-  async revokeDevice(deviceId: string): Promise<void> {
-    this.store.revokeDevice(deviceId)
-    this.turnCredentials.forget(deviceId)
-    this.dropPeer(deviceId, 'AUTH_INVALID')
+  async revokeDevice(tenantId: string, deviceId: string): Promise<void> {
+    if (this.store.getTenant(tenantId) === null) return
+    this.store.revokeDevice(tenantId, deviceId)
+    this.turnCredentials.forget(peerKey(tenantId, deviceId))
+    this.dropPeer(tenantId, deviceId, 'AUTH_INVALID')
   }
 
-  async renameDevice(deviceId: string, name: string): Promise<void> {
-    this.store.renameDevice(deviceId, name)
+  async renameDevice(tenantId: string, deviceId: string, name: string): Promise<void> {
+    if (this.store.getTenant(tenantId) === null) return
+    this.store.renameDevice(tenantId, deviceId, name)
   }
 
   /** True only during a live, unexpired link's negotiation window. */
-  private turnLink(deviceId: string, connectionId: string): Link | undefined {
+  private turnLink(tenantId: string, deviceId: string, connectionId: string): Link | undefined {
     const link = this.links.get(connectionId)
-    if (link === undefined || (link.host !== deviceId && link.client !== deviceId)) return
+    if (this.store.getTenant(tenantId) === null || link === undefined || link.tenantId !== tenantId || (link.host !== deviceId && link.client !== deviceId)) return
     if (link.stage !== 'accepted' && link.stage !== 'handshake') return
     if (Date.now() - link.created >= LINK_PENDING_TIMEOUT_MS) return
     for (const id of [link.host, link.client]) {
-      const socket = this.peers.get(id)
+      const socket = this.peer(link.tenantId, id)
       if (socket?.readyState !== WebSocket.OPEN) return
-      const device = this.store.getDevice(id)
-      if (device === null || device.revoked !== 0) return
+      const attachment = socket.deserializeAttachment() as Attachment
+      const device = this.store.getDevice(tenantId, id)
+      if (attachment.tenantId !== tenantId || attachment.deviceId !== id || attachment.state !== 'authenticated'
+        || device === null || device.revoked !== 0 || device.role !== attachment.role) return
     }
     return link
   }
 
-  async authorizeTurn(deviceId: string, connectionId: string): Promise<boolean> {
-    return this.turnLink(deviceId, connectionId) !== undefined
+  async authorizeTurn(tenantId: string, deviceId: string, connectionId: string): Promise<boolean> {
+    return this.turnLink(tenantId, deviceId, connectionId) !== undefined
   }
+
+  async resolveTenant(identity: TenantIdentity): Promise<Result<TenantPrincipal>> {
+    try {
+      const parsedMax = Number(this.env.DSH_SERVER_MAX_TENANTS ?? 10)
+      return ok(this.store.resolveTenant(identity, {
+        maxTenants: Number.isSafeInteger(parsedMax) && parsedMax > 0 && parsedMax <= 100 ? parsedMax : 10,
+        ...(this.env.DSH_SERVER_LEGACY_OWNER_SUBJECT ? { legacyOwnerSubject: this.env.DSH_SERVER_LEGACY_OWNER_SUBJECT } : {}),
+        ...(this.env.DSH_SERVER_LEGACY_OWNER_ISSUER ? { legacyOwnerIssuer: this.env.DSH_SERVER_LEGACY_OWNER_ISSUER } : {}),
+        legacyAccount: this.env.DSH_SERVER_ACCOUNT,
+        legacyMembershipId: legacyMembership(this.env.DSH_SERVER_ACCOUNT),
+      }))
+    } catch (error) { return fromThrown(error) }
+  }
+
+  async getTenant(tenantId: string): Promise<TenantPrincipal | null> { return this.store.getTenant(tenantId) }
 
   // --- lockout (kept here because SQLite is the only durable store) ---------
 

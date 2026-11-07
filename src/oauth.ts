@@ -123,6 +123,8 @@ export interface OAuthState {
   qrId: string | null
   /** Session row holding the PKCE verifier, for the direct flow where qrId is null. */
   flowId?: string
+  /** Signed enrollment-only flow; never issues a session or resolves a tenant. */
+  identityProbe?: true
   iat: number
   exp: number
 }
@@ -137,7 +139,7 @@ const STATE_TTL_SECONDS = 600
  * server uses a JWT; this is the same shape with HMAC-SHA256.
  */
 export async function signState(secret: string, input: {
-  providerId: string; returnTo: string; qrId: string | null; flowId?: string; nonce?: string
+  providerId: string; returnTo: string; qrId: string | null; flowId?: string; nonce?: string; identityProbe?: true
 }): Promise<string> {
   const now = Math.floor(Date.now() / 1000)
   const payload: OAuthState = {
@@ -146,6 +148,7 @@ export async function signState(secret: string, input: {
     nonce: input.nonce ?? toBase64Url(crypto.getRandomValues(new Uint8Array(16))),
     qrId: input.qrId,
     ...(input.flowId === undefined ? {} : { flowId: input.flowId }),
+    ...(input.identityProbe === true ? { identityProbe: true } : {}),
     iat: now,
     exp: now + STATE_TTL_SECONDS,
   }
@@ -176,6 +179,7 @@ export async function verifyState(
   if (typeof record.nonce !== 'string' || record.nonce.length < 8) return null
   if (record.qrId !== null && typeof record.qrId !== 'string') return null
   if (record.flowId !== undefined && typeof record.flowId !== 'string') return null
+  if (record.identityProbe !== undefined && record.identityProbe !== true) return null
   if (typeof record.iat !== 'number' || typeof record.exp !== 'number') return null
   // Expiry is checked here rather than trusted from the caller: a state that outlives
   // its window is replayable even if every other field is intact.
@@ -184,6 +188,7 @@ export async function verifyState(
     typ: record.typ, returnTo: record.returnTo, nonce: record.nonce,
     qrId: (record.qrId as string | null),
     ...(typeof record.flowId === 'string' ? { flowId: record.flowId } : {}),
+    ...(record.identityProbe === true ? { identityProbe: true } : {}),
     iat: record.iat, exp: record.exp,
   }
 }

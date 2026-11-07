@@ -16,6 +16,7 @@ import { signSession, sha256Hex, verifySession, toBase64Url } from './crypto.js'
 import type { IceServer } from './turn.js'
 import { isDeviceId, isIdentityKey } from './protocol.js'
 import type { Result } from './result.js'
+import type { TenantPrincipal, TenantIdentity } from './store.js'
 import { corsHeaders, parseAllowedOrigins, preflightResponse } from './cors.js'
 import {
   handleCallback, landingPage, pollSession, providersResponse, startRedirect, startSession,
@@ -32,11 +33,13 @@ interface TokenPair {
   accessTokenExpiresAt: number; refreshTokenExpiresAt: number
 }
 interface AuthenticatedDevice {
+  tenantId: string; account: string; membershipId: string
   deviceId: string; role: 'host' | 'client'; name: string; platform: string
   identityKey: string; clientVersion: string; harnessVersion: string | null
   revoked: boolean; lastSeenAt: number; online: boolean
 }
 interface DeviceSummary {
+  tenantId: string; membershipId: string
   deviceId: string; role: string; name: string; platform: string; clientVersion: string
   identityKey: string; harnessVersion: string | null; lastSeenAt: number; online: boolean
 }
@@ -114,8 +117,14 @@ async function route(
   // and the QR landing page is opened by a phone browser that must not be handed a
   // JSON error envelope.
   if (url.pathname.startsWith('/api/v1/auth/oauth/') || url.pathname.startsWith('/api/v1/auth/q/')) {
-    const response = await routeOAuth(request, env, url)
-    if (response !== null) return response
+    try {
+      const response = await routeOAuth(request, env, url)
+      if (response !== null) return response
+    } catch (error) {
+      const response = mapError(error)
+      response.headers.set('Referrer-Policy', 'no-referrer')
+      return response
+    }
   }
 
   if (url.pathname.startsWith('/api/')) {
@@ -310,7 +319,9 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       account: session.account,
       profile: { displayName: session.account },
       isAdmin: false,
-    })
+      tenantId: session.tenantId,
+      identity: { issuer: session.issuer, subject: session.subject },
+    }, { headers: { 'Cache-Control': 'no-store' } })
   }
 
   if (method === 'POST' && path === '/api/v1/auth/logout') {
@@ -320,8 +331,8 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (method === 'POST' && path === '/api/v1/devices/register') {
-    await requireSession(request, env)
-    return registerDevice(request, env)
+    const principal = await requireSession(request, env)
+    return registerDevice(request, env, principal.tenantId)
   }
 
   // Claim a Host device with an already-authorized device credential.
@@ -337,10 +348,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   // is a separate device with its own key pair and credentials.
   if (method === 'POST' && path === '/api/v1/devices/register-owned-role') {
     const authorizing = await requireDevice(request, env)
-    return registerDevice(request, env, {
-      owner: env.DSH_SERVER_ACCOUNT,
-      claimedBy: authorizing.deviceId,
-    })
+    return registerDevice(request, env, authorizing.tenantId)
   }
 
   if (method === 'POST' && path === '/api/v1/auth/refresh') {
@@ -354,7 +362,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
   if (method === 'DELETE' && path === '/api/v1/devices/self') {
     const device = await requireDevice(request, env)
-    await callGateway<void>(env, 'revokeDevice', [device.deviceId])
+    await callGateway<void>(env, 'revokeDevice', [device.tenantId, device.deviceId])
     return Response.json({ status: 'revoked' })
   }
 
@@ -367,22 +375,22 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   // than device-scoped, so a device token cannot revoke its peers.
   const revokeMatch = /^\/api\/v1\/account\/devices\/([^/]+)$/.exec(path)
   if (method === 'DELETE' && revokeMatch !== null) {
-    await requireSession(request, env)
+    const principal = await requireSession(request, env)
     const target = decodeURIComponent(revokeMatch[1]!)
-    const existing = await callGateway<DeviceSummary | null>(env, 'getDevice', [target])
+    const existing = await callGateway<DeviceSummary | null>(env, 'getDevice', [principal.tenantId, target])
     if (existing === null) throw new ApiError('DEVICE_NOT_FOUND', 404)
-    await callGateway<void>(env, 'revokeDevice', [target])
+    await callGateway<void>(env, 'revokeDevice', [principal.tenantId, target])
     return Response.json({ status: 'revoked', deviceId: target })
   }
 
   if (method === 'GET' && path === '/api/v1/me') {
     const device = await requireDevice(request, env)
-    return Response.json(descriptor(device, env))
+    return Response.json(descriptor(device))
   }
 
   if (method === 'GET' && path === '/api/v1/account/devices') {
-    await requireSession(request, env)
-    const devices = await callGateway<DeviceSummary[]>(env, 'listDevices', [])
+    const principal = await requireSession(request, env)
+    const devices = await callGateway<DeviceSummary[]>(env, 'listDevices', [principal.tenantId])
     return Response.json({
       items: devices.map(device => ({
         deviceId: device.deviceId,
@@ -393,7 +401,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
         harnessVersion: device.harnessVersion,
         online: device.online,
         lastSeenAt: device.lastSeenAt,
-        membershipId: membershipId(env),
+        membershipId: principal.membershipId,
       })),
       serverUrl: env.DSH_SERVER_PUBLIC_URL,
       transport: 'webrtc',
@@ -403,7 +411,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   if (method === 'GET' && path === '/api/v1/devices') {
     const device = await requireDevice(request, env)
     if (device.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED', 403)
-    const devices = await callGateway<DeviceSummary[]>(env, 'listDevices', [])
+    const devices = await callGateway<DeviceSummary[]>(env, 'listDevices', [device.tenantId])
     return Response.json({
       items: devices
         .filter(entry => entry.role === 'host')
@@ -412,7 +420,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
         // that peer, and a key taken from a list would let the server substitute one
         // without the client noticing. Only the single-peer endpoint carries it.
         .map(entry => {
-          const { identityKey: _identityKey, ...rest } = descriptor(entry, env)
+          const { identityKey: _identityKey, ...rest } = descriptor({ ...entry, membershipId: device.membershipId })
           return rest
         }),
       nextCursor: null,
@@ -431,14 +439,14 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
   const renameMatch = /^\/api\/v1\/devices\/([^/]+)\/name$/.exec(path)
   if (method === 'POST' && renameMatch !== null) {
-    await requireSession(request, env)
+    const principal = await requireSession(request, env)
     const body = await readJson(request)
     const name = requireString(body, 'name', 80).trim()
     if (name === '') throw new ApiError('INVALID_MESSAGE', 400)
-    await callGateway<void>(env, 'renameDevice', [renameMatch[1]!, name])
-    const device = await callGateway<DeviceSummary | null>(env, 'getDevice', [renameMatch[1]!])
+    await callGateway<void>(env, 'renameDevice', [principal.tenantId, renameMatch[1]!, name])
+    const device = await callGateway<DeviceSummary | null>(env, 'getDevice', [principal.tenantId, renameMatch[1]!])
     if (device === null) throw new ApiError('DEVICE_NOT_FOUND', 404)
-    return Response.json(descriptor(device, env))
+    return Response.json(descriptor(device))
   }
 
   const deviceMatch = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)
@@ -449,7 +457,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     // perform the mandatory Host/client lookup in one DO hop rather than three.
     const result = await callGateway<Result<DeviceSummary>>(env, 'getAuthorizedPeer', [token, deviceMatch[1]!])
     if (!result.ok) throw new ApiError(result.code, result.status)
-    const full = descriptor(result.value, env)
+    const full = descriptor(result.value)
     return Response.json(deviceMatch[2] !== undefined
       ? { deviceId: full.deviceId, online: full.online, lastSeenAt: full.lastSeenAt }
       : full)
@@ -505,9 +513,12 @@ async function login(request: Request, env: Env, client: string): Promise<Respon
 
   await callGateway<void>(env, 'clearFailures', [accountKey])
 
-  // The session is a signed cookie, so validating it never reaches the DO.
+  // Sign the reserved password-owner principal; authorization checks its live registry.
   const expiresAt = Date.now() + SESSION_TTL_MS
-  const token = await signSession(sessionSecret(env), { account: outcome.account, expiresAt })
+  const principal = await callGateway<TenantPrincipal | null>(env, 'getTenant', ['legacy-owner'])
+  if (principal === null) throw new ApiError('AUTH_SERVICE_UNAVAILABLE', 503)
+  const token = await signSession(sessionSecret(env), { v: 2, tenantId: principal.tenantId,
+    account: principal.account, issuer: principal.issuer, subject: principal.subject, expiresAt })
 
   return Response.json(
     {
@@ -521,21 +532,24 @@ async function login(request: Request, env: Env, client: string): Promise<Respon
   )
 }
 
-async function requireSession(request: Request, env: Env): Promise<{ account: string }> {
+async function requireSession(request: Request, env: Env): Promise<TenantPrincipal> {
   // A device bearer is not a session: mixing the two authorities would let a
   // paired device manage the whole account.
   const token = sessionCookie(request) ?? bearer(request)
   if (token === null) throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401)
   const session = await verifySession(sessionSecret(env), token)
-  if (session === null) throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401)
-  return { account: session.account }
+  // Tenantless legacy sessions cannot select or claim an owner partition.
+  if (session === null || session.v !== 2 || !session.tenantId || typeof session.issuer !== 'string' || typeof session.subject !== 'string') {
+    throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401)
+  }
+  const principal = await callGateway<TenantPrincipal | null>(env, 'getTenant', [session.tenantId])
+  if (principal === null || principal.issuer !== session.issuer || principal.subject !== session.subject) {
+    throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401)
+  }
+  return principal
 }
 
-async function requireDevice(request: Request, env: Env): Promise<{
-  deviceId: string; role: 'host' | 'client'; name: string; platform: string
-  identityKey: string; clientVersion: string; harnessVersion: string | null
-  online: boolean; lastSeenAt: number
-}> {
+async function requireDevice(request: Request, env: Env): Promise<AuthenticatedDevice> {
   const token = bearer(request)
   if (token === null) throw new ApiError('AUTH_REQUIRED', 401)
   const result = await callGateway<Result<AuthenticatedDevice>>(env, 'authenticateDevice', [token])
@@ -562,7 +576,7 @@ function cookieHeader(env: Env, value: string, maxAgeSeconds: number): string {
 async function registerDevice(
   request: Request,
   env: Env,
-  claim?: { owner: string; claimedBy: string },
+  tenantId: string,
 ): Promise<Response> {
   const body = await readJson(request)
   if (body.v !== 1) throw new ApiError('UNSUPPORTED_VERSION', 400)
@@ -585,7 +599,7 @@ async function registerDevice(
   }
   if (role === 'client' && harnessVersion !== undefined) throw new ApiError('INVALID_MESSAGE', 400)
 
-  const issued = await callGateway<Result<TokenPair>>(env, 'registerDevice', [{
+  const issued = await callGateway<Result<TokenPair>>(env, 'registerDevice', [tenantId, {
     deviceId, role, name, platform, identityKey, clientVersion,
     ...(typeof harnessVersion === 'string' ? { harnessVersion } : {}),
   }])
@@ -604,33 +618,21 @@ async function registerDevice(
  */
 function descriptor(device: {
   deviceId: string; role: string; name: string; platform: string; clientVersion: string
-  identityKey: string
+  identityKey: string; membershipId: string
   harnessVersion?: string | null; online?: boolean; lastSeenAt?: number
-}, env: Env): Record<string, unknown> {
+}): Record<string, unknown> {
   return {
     deviceId: device.deviceId,
     name: device.name,
     role: device.role,
     platform: device.platform,
     identityKey: device.identityKey,
-    membershipId: membershipId(env),
+    membershipId: device.membershipId,
     clientVersion: device.clientVersion,
     ...(device.harnessVersion != null ? { harnessVersion: device.harnessVersion } : {}),
     ...(device.online !== undefined ? { online: device.online } : {}),
     ...(device.lastSeenAt !== undefined ? { lastSeenAt: device.lastSeenAt } : {}),
   }
-}
-
-/** Stable account handle the clients show in the device list. */
-function membershipId(env: Env): string {
-  // Not a security boundary: it is a display id. Derived from the account name so
-  // it stays stable across restarts without a database read.
-  let hashValue = 0
-  const source = `account:${env.DSH_SERVER_ACCOUNT}`
-  for (let i = 0; i < source.length; i += 1) {
-    hashValue = (Math.imul(hashValue, 31) + source.charCodeAt(i)) >>> 0
-  }
-  return `account:${hashValue.toString(16).padStart(8, '0')}`
 }
 
 // ---------------------------------------------------------------------------
@@ -707,9 +709,17 @@ void deviceIdFromRequest
 async function routeOAuth(request: Request, env: Env, url: URL): Promise<Response | null> {
   const deps: OAuthDeps = {
     call: (method, args) => callGateway(env, method, args),
-    issueSession: async account => {
+    resolveIdentity: async (identity: TenantIdentity) => {
+      const result = await callGateway<Result<TenantPrincipal>>(env, 'resolveTenant', [identity])
+      if (!result.ok) throw new ApiError(result.code, result.status)
+      return result.value
+    },
+    issueSession: async principal => {
       const expiresAt = Date.now() + SESSION_TTL_MS
-      const token = await signSession(sessionSecret(env), { account, expiresAt })
+      const token = await signSession(sessionSecret(env), {
+        v: 2, tenantId: principal.tenantId, account: principal.account,
+        issuer: principal.issuer, subject: principal.subject, expiresAt,
+      })
       return { token, expiresAt }
     },
     errorResponse,
