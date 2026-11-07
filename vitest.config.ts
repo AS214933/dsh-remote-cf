@@ -4,9 +4,9 @@ import { fileURLToPath } from 'node:url'
 export default defineConfig({
   resolve: {
     alias: {
-      // The Workers runtime provides `cloudflare:workers`; vitest runs in Node and
-      // cannot resolve it. Tests never construct the Durable Object, so a stub
-      // whose base class does nothing is enough for the module to load.
+      // Node lifecycle tests construct Gateway with clone-on-read socket attachments.
+      // Only the runtime base class is stubbed here; the integration script separately
+      // runs real workerd with explicit WebSocket-preserving hibernation.
       'cloudflare:workers': fileURLToPath(new URL('./test/stubs/cloudflare-workers.ts', import.meta.url)),
     },
   },

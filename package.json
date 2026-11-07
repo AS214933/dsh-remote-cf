@@ -9,7 +9,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:runtime": "node test/gateway-runtime.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261104.1",

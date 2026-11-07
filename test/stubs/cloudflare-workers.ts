@@ -2,10 +2,9 @@
  * Stand-in for the `cloudflare:workers` module, which only exists inside the
  * Workers runtime.
  *
- * `Gateway` extends `DurableObject` from that module. Vitest runs in Node, so the
- * import has to resolve to something; the tests in this project exercise routing
- * and protocol logic, never the Durable Object's lifecycle, so an inert base class
- * is sufficient and no behaviour is faked that a test depends on.
+ * `Gateway` extends this base class. Lifecycle tests supply their own state and
+ * cloned socket attachments but execute the real Gateway handlers. Real workerd
+ * hibernation is exercised separately by test/gateway-runtime.mjs.
  */
 export class DurableObject<Env = unknown> {
   protected readonly ctx: DurableObjectState

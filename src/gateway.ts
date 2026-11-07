@@ -1,10 +1,10 @@
 /**
  * The Gateway Durable Object: one instance holds every WebSocket for the account.
  *
- * Single-account means peers and links are ordinary in-memory maps — the same
- * shape as the reference implementation's single process. Per-connection state
- * that must survive hibernation goes in `serializeAttachment`, because the
- * constructor runs again after the object is evicted.
+ * Unlike the reference's long-lived process, this object can hibernate between
+ * any two frames. Peers are restored in the constructor; each client's one link
+ * (including handshake stage and replay counters) lives in its socket attachment.
+ * No payload, ciphertext or credential is stored in the link snapshot.
  *
  * Frames are only ever interpreted in `awaiting_hello` or `authenticated`;
  * `closing` exists so a hello that loses the race against the handshake deadline
@@ -34,8 +34,12 @@ interface Attachment {
   capabilities?: string[]
   version?: string
   lastPong?: number
-  /** When this socket completed hello; used to tell a retry from a real second instance. */
-  connectedAt?: number
+  /** Stable identity of this authenticated socket, not the device identity. */
+  sessionId?: string
+  helloDeadline?: number
+  nextPingAt?: number
+  /** One logical link per client; hosting sockets do not carry all their clients. */
+  link?: LinkSnapshot
   nonce?: string | undefined
   /** Frame budget window, reset per second. */
   windowStart?: number
@@ -53,6 +57,12 @@ interface Link {
   counters: Map<string, number>
   preferredTransports: TransportName[]
   iceCandidates: number
+}
+
+interface LinkSnapshot extends Omit<Link, 'counters'> {
+  counters: Array<[string, number]>
+  hostSessionId: string
+  clientSessionId: string
 }
 
 const WEBRTC_FALLBACK_TIMEOUT_MS = 12_000
@@ -105,6 +115,61 @@ export class Gateway extends DurableObject<Env> {
     // so this happens once per cold start, not per request — re-running them on
     // every access was a needless source of SQLite lock contention.
     this.store = new Store(ctx.storage)
+    this.restoreConnections()
+  }
+
+  /** Rebuild before any message, RPC or alarm, not only when a heartbeat happens. */
+  private restoreConnections(): void {
+    const sockets = this.ctx.getWebSockets()
+    for (const socket of sockets) {
+      const attachment = (socket.deserializeAttachment() ?? {}) as Attachment
+      // A close/error can itself wake the object. Keep its identity long enough
+      // to restore then tear down its links; filtering it out first loses cleanup.
+      if (attachment.state !== 'authenticated' || attachment.deviceId === undefined) continue
+      if (attachment.sessionId === undefined) {
+        attachment.sessionId = crypto.randomUUID()
+        socket.serializeAttachment(attachment)
+      }
+      this.peers.set(attachment.deviceId, socket)
+    }
+    for (const socket of this.peers.values()) {
+      const attachment = socket.deserializeAttachment() as Attachment
+      const saved = attachment.link
+      if (attachment.role !== 'client' || saved === undefined) continue
+      const host = this.peers.get(saved.host)
+      const hostAttachment = host?.deserializeAttachment() as Attachment | undefined
+      if (saved.client !== attachment.deviceId || saved.clientSessionId !== attachment.sessionId
+        || hostAttachment?.sessionId !== saved.hostSessionId) {
+        delete attachment.link
+        socket.serializeAttachment(attachment)
+        continue
+      }
+      this.links.set(saved.id, { ...saved, counters: new Map(saved.counters) })
+    }
+  }
+
+  /** Attach a bounded snapshot to the client before forwarding a state transition. */
+  private saveLink(link: Link): void {
+    const client = this.peers.get(link.client)
+    const host = this.peers.get(link.host)
+    if (client === undefined || host === undefined) return
+    const attachment = client.deserializeAttachment() as Attachment
+    const hostAttachment = host.deserializeAttachment() as Attachment
+    if (attachment.sessionId === undefined || hostAttachment.sessionId === undefined) return
+    attachment.link = { ...link, counters: [...link.counters],
+      hostSessionId: hostAttachment.sessionId, clientSessionId: attachment.sessionId }
+    client.serializeAttachment(attachment)
+  }
+
+  private forgetLink(link: Link): void {
+    this.links.delete(link.id)
+    const client = this.peers.get(link.client)
+    if (client === undefined) return
+    const attachment = client.deserializeAttachment() as Attachment
+    if (attachment.link?.id === link.id) {
+      delete attachment.link
+      client.serializeAttachment(attachment)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -130,7 +195,8 @@ export class Gateway extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server)
     const now = Date.now()
     server.serializeAttachment({
-      state: 'awaiting_hello', windowStart: now, frames: 0, bytes: 0,
+      state: 'awaiting_hello', helloDeadline: now + this.timing.helloTimeoutMs,
+      windowStart: now, frames: 0, bytes: 0,
     } satisfies Attachment)
 
     // The hello deadline is enforced by an alarm rather than setTimeout: timers
@@ -144,6 +210,11 @@ export class Gateway extends DurableObject<Env> {
   override async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
     const attachment = (ws.deserializeAttachment() ?? { state: 'awaiting_hello' }) as Attachment
     if (attachment.state === 'closing' || attachment.state === 'closed') return
+    if (attachment.state === 'awaiting_hello' && attachment.helloDeadline !== undefined
+      && Date.now() >= attachment.helloDeadline) {
+      this.fail(ws, 'AUTH_REQUIRED')
+      return
+    }
     if (typeof raw !== 'string') {
       // The protocol is text-only; a binary frame is a peer bug or an attack.
       this.fail(ws, 'INVALID_MESSAGE')
@@ -167,6 +238,7 @@ export class Gateway extends DurableObject<Env> {
       this.fail(ws, 'RATE_LIMITED')
       return
     }
+    ws.serializeAttachment(attachment)
 
     let frame: ControlFrame
     try {
@@ -220,8 +292,9 @@ export class Gateway extends DurableObject<Env> {
 
   override async webSocketError(ws: WebSocket): Promise<void> {
     const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-    if (attachment.deviceId !== undefined) this.dropPeer(attachment.deviceId, 'CONNECTION_FAILED')
-    else this.fail(ws, 'CONNECTION_FAILED')
+    if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
+      this.dropPeer(attachment.deviceId, 'CONNECTION_FAILED')
+    } else this.closeQuietly(ws, 'CONNECTION_FAILED')
   }
 
   // -------------------------------------------------------------------------
@@ -291,32 +364,18 @@ export class Gateway extends DurableObject<Env> {
       return
     }
 
-    // The hello may have raced the deadline; if the state moved on, drop it.
-    if (attachment.state !== 'awaiting_hello') return
-
-    // Replace an existing connection for this device.
-    //
-    // The reason matters to the client: 4003 means "another instance owns this identity,
-    // stop reconnecting", which is right for a genuine second instance but wrong for a
-    // reconnect race. A client that drops and reconnects can reach here while its old
-    // socket is still registered — the close frame has not arrived yet — and answering
-    // 4003 then leaves it permanently disconnected for a reason that is not real.
-    //
-    // So the reason is chosen by age: a previous socket that has been up for less than a
-    // minute is almost certainly the same client retrying, and gets a retryable close. A
-    // long-lived one really is a second instance taking over.
-    const previous = this.peers.get(hello.deviceId)
-    if (previous !== undefined && previous !== ws) {
-      const previousAttachment = (previous.deserializeAttachment() ?? {}) as Attachment
-      const ageMs = Date.now() - (previousAttachment.connectedAt ?? 0)
-      const raceWindowMs = 60_000
-      const reason = ageMs < raceWindowMs ? 'CONNECTION_FAILED' : 'CONNECTION_REPLACED'
-      console.warn('replacing live peer connection', {
-        deviceId: hello.deviceId, role: hello.role, clientVersion: hello.clientVersion,
-        previousAgeMs: ageMs, reason,
-      })
-      this.disconnect(hello.deviceId, reason)
+    // Hashing yields: re-read the attachment so an expired/closed hello cannot win.
+    const latest = (ws.deserializeAttachment() ?? {}) as Attachment
+    if (latest.state !== 'awaiting_hello') return
+    if (latest.helloDeadline !== undefined && Date.now() >= latest.helloDeadline) {
+      this.fail(ws, 'AUTH_REQUIRED')
+      return
     }
+
+    // Match the reference: close only the predecessor with 4003. A time-based
+    // heuristic cannot identify an instance and makes two clients fight to reconnect.
+    const previous = this.peers.get(hello.deviceId)
+    if (previous !== undefined && previous !== ws) this.disconnect(hello.deviceId, 'CONNECTION_REPLACED')
 
     attachment.state = 'authenticated'
     attachment.deviceId = hello.deviceId
@@ -324,7 +383,9 @@ export class Gateway extends DurableObject<Env> {
     attachment.capabilities = this.negotiatedCapabilities(hello.capabilities)
     attachment.version = hello.clientVersion ?? device.client_version
     attachment.lastPong = Date.now()
-    attachment.connectedAt = Date.now()
+    attachment.nextPingAt = Date.now() + this.timing.heartbeatIntervalMs
+    attachment.sessionId = crypto.randomUUID()
+    delete attachment.helloDeadline
     ws.serializeAttachment(attachment)
 
     this.peers.set(hello.deviceId, ws)
@@ -372,7 +433,6 @@ export class Gateway extends DurableObject<Env> {
       const { nonce } = parsePingPong(frame.payload)
       if (attachment.nonce !== undefined && nonce === attachment.nonce) {
         attachment.lastPong = Date.now()
-    attachment.connectedAt = Date.now()
         attachment.nonce = undefined
         ws.serializeAttachment(attachment)
       }
@@ -427,6 +487,7 @@ export class Gateway extends DurableObject<Env> {
         })
         throw new ProtocolError('INVALID_MESSAGE')
       }
+      this.saveLink(link)
       this.send(other, frame)
       return
     }
@@ -437,6 +498,7 @@ export class Gateway extends DurableObject<Env> {
       // Reject a rewound or replayed counter: the clients rely on this ordering.
       if (counter <= last) throw new ProtocolError('INVALID_MESSAGE')
       link.counters.set(attachment.deviceId, counter)
+      this.saveLink(link)
       this.send(other, frame)
       return
     }
@@ -467,11 +529,12 @@ export class Gateway extends DurableObject<Env> {
 
     const clientSocket = this.peers.get(link.client)
     if (frame.type === 'connect.rejected') {
-      this.links.delete(link.id)
+      this.forgetLink(link)
       if (clientSocket !== undefined) this.send(clientSocket, frame)
       return
     }
     link.stage = 'accepted'
+    this.saveLink(link)
     console.warn('link stage', { linkId: link.id, stage: link.stage, transports: link.preferredTransports })
     if (clientSocket !== undefined) this.send(clientSocket, frame)
   }
@@ -540,6 +603,8 @@ export class Gateway extends DurableObject<Env> {
       iceCandidates: 0,
     }
     this.links.set(link.id, link)
+    this.saveLink(link)
+    void this.scheduleAlarm()
 
     this.send(hostSocket, createControlFrame('connect.incoming', {
       connectionId: link.id,
@@ -619,6 +684,7 @@ export class Gateway extends DurableObject<Env> {
       if (sender.deviceId !== link.host) throw new ProtocolError('INVALID_MESSAGE')
     } else {
       if (++link.iceCandidates > MAX_ICE_CANDIDATES_PER_CONNECTION) throw new ProtocolError('INVALID_MESSAGE')
+      this.saveLink(link)
     }
     this.send(other, frame)
   }
@@ -630,57 +696,59 @@ export class Gateway extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     const now = Date.now()
     const { heartbeatDisconnectMs, heartbeatIntervalMs } = this.timing
-    // Nothing in this method may touch SQLite. The alarm and an in-flight request
-    // would otherwise contend for the same database handle, and a busy timeout
-    // during a login is an outage.
-
-    // Rebuild the peer map from attachments. After eviction the maps are empty but
-    // the sockets are alive, so this is how the object finds them again.
-    this.peers.clear()
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = (socket.deserializeAttachment() ?? {}) as Attachment
-      if (attachment.state === 'authenticated' && attachment.deviceId !== undefined) {
-        this.peers.set(attachment.deviceId, socket)
+      if (attachment.state === 'awaiting_hello' && (attachment.helloDeadline ?? 0) <= now) {
+        this.fail(socket, 'AUTH_REQUIRED')
       }
     }
-
     for (const [deviceId, socket] of this.peers) {
       const attachment = (socket.deserializeAttachment() ?? {}) as Attachment
-      const lastPong = attachment.lastPong ?? 0
-      if (now - lastPong > heartbeatDisconnectMs) {
+      if (now - (attachment.lastPong ?? 0) > heartbeatDisconnectMs) {
         this.dropPeer(deviceId, 'CONNECTION_FAILED')
         continue
       }
+      if (now < (attachment.nextPingAt ?? 0)) continue
       attachment.nonce = crypto.randomUUID()
+      attachment.nextPingAt = now + heartbeatIntervalMs
       socket.serializeAttachment(attachment)
       this.send(socket, createControlFrame('ping', { nonce: attachment.nonce }))
     }
-
     for (const link of [...this.links.values()]) {
-      if (link.stage !== 'ready' && now - link.created > LINK_PENDING_TIMEOUT_MS) {
+      if (link.stage !== 'ready' && now - link.created >= LINK_PENDING_TIMEOUT_MS) {
         this.dropLink(link, 'CONNECTION_FAILED')
       }
     }
-
-    await this.scheduleAlarm(now + heartbeatIntervalMs)
+    await this.scheduleAlarm()
   }
 
-  /**
-   * Keep exactly one alarm pending.
-   *
-   * `setAlarm` replaces any existing alarm, so there is no need to read first — and
-   * reading added an extra storage round trip that could fail independently. The
-   * returned promise is deliberately not awaited by the callers that fire it from
-   * the request path: a login must not fail because the heartbeat could not be
-   * rescheduled.
-   */
-  private async scheduleAlarm(at?: number): Promise<void> {
-    const target = at ?? Date.now() + this.timing.heartbeatIntervalMs
-    try {
-      await this.ctx.storage.setAlarm(target)
-    } catch {
-      // A failed reschedule is not fatal: the next event retries.
-    }
+  /** Serialize scheduling decisions; new arrivals must never postpone older deadlines. */
+  private alarmScheduling: Promise<void> = Promise.resolve()
+
+  private scheduleAlarm(): Promise<void> {
+    const scheduled = this.alarmScheduling.then(async () => {
+      const now = Date.now()
+      let next = Number.POSITIVE_INFINITY
+      for (const socket of this.ctx.getWebSockets()) {
+        const attachment = (socket.deserializeAttachment() ?? {}) as Attachment
+        if (attachment.state === 'awaiting_hello') {
+          next = Math.min(next, attachment.helloDeadline ?? now)
+        } else if (attachment.state === 'authenticated') {
+          next = Math.min(next, attachment.nextPingAt ?? now + this.timing.heartbeatIntervalMs)
+        }
+      }
+      for (const link of this.links.values()) {
+        if (link.stage !== 'ready') next = Math.min(next, link.created + LINK_PENDING_TIMEOUT_MS)
+      }
+      if (!Number.isFinite(next)) return
+      const current = await this.ctx.storage.getAlarm()
+      const target = Math.max(now + 1, next)
+      if (current === null || current <= now || target < current) {
+        await this.ctx.storage.setAlarm(target)
+      }
+    })
+    this.alarmScheduling = scheduled.catch(() => { /* next event retries scheduling */ })
+    return this.alarmScheduling
   }
 
   // -------------------------------------------------------------------------
@@ -689,17 +757,17 @@ export class Gateway extends DurableObject<Env> {
 
   private dropPeer(deviceId: string, code: string): void {
     const socket = this.peers.get(deviceId)
-    this.peers.delete(deviceId)
     for (const link of [...this.links.values()]) {
       if (link.host === deviceId || link.client === deviceId) this.dropLink(link, code)
     }
+    this.peers.delete(deviceId)
     if (socket !== undefined) this.closeQuietly(socket, code)
   }
 
   private disconnect(deviceId: string, code: string): void { this.dropPeer(deviceId, code) }
 
   private dropLink(link: Link, code: string): void {
-    this.links.delete(link.id)
+    this.forgetLink(link)
     for (const id of [link.host, link.client]) {
       const socket = this.peers.get(id)
       if (socket === undefined) continue
@@ -713,6 +781,13 @@ export class Gateway extends DurableObject<Env> {
   }
 
   private fail(ws: WebSocket, code: string): void {
+    const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
+    if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
+      for (const link of [...this.links.values()]) {
+        if (link.host === attachment.deviceId || link.client === attachment.deviceId) this.dropLink(link, code)
+      }
+      this.peers.delete(attachment.deviceId)
+    }
     this.closeQuietly(ws, code, createControlFrame('error', { code, message: code, retryable: false }))
   }
 
@@ -745,6 +820,10 @@ export class Gateway extends DurableObject<Env> {
    */
   private closeQuietly(ws: WebSocket, code: string, frame?: ControlFrame): void {
     try {
+      const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
+      attachment.state = 'closing'
+      delete attachment.link
+      ws.serializeAttachment(attachment)
       if (frame !== undefined) this.send(ws, frame)
       const closeCode = code === 'CONNECTION_REPLACED' ? CLOSE_CODE_REPLACED : SERVER_SHUTDOWN_CLOSE_CODE
       ws.close(closeCode, code)
@@ -760,7 +839,9 @@ export class Gateway extends DurableObject<Env> {
     const queued = this.pending.get(ws) ?? 0
     if (queued + payload.length > MAX_BUFFERED_BYTES) {
       const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-      if (attachment.deviceId !== undefined) this.dropPeer(attachment.deviceId, 'SLOW_CONSUMER')
+      if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
+        this.dropPeer(attachment.deviceId, 'SLOW_CONSUMER')
+      }
       return
     }
     try {
@@ -774,7 +855,9 @@ export class Gateway extends DurableObject<Env> {
       }, 100)
     } catch {
       const attachment = (ws.deserializeAttachment() ?? {}) as Attachment
-      if (attachment.deviceId !== undefined) this.dropPeer(attachment.deviceId, 'CONNECTION_FAILED')
+      if (attachment.deviceId !== undefined && this.peers.get(attachment.deviceId) === ws) {
+        this.dropPeer(attachment.deviceId, 'CONNECTION_FAILED')
+      }
     }
   }
 
