@@ -1141,9 +1141,11 @@ export class Gateway extends DurableObject<Env> {
 
   async resolveTenant(identity: TenantIdentity): Promise<Result<TenantPrincipal>> {
     try {
-      const parsedMax = Number(this.env.DSH_SERVER_MAX_TENANTS ?? 10)
+      const configuredMax = this.env.DSH_SERVER_MAX_TENANTS?.trim() ?? ''
+      const parsedMax = configuredMax === '' ? 0 : /^\d+$/.test(configuredMax) ? Number(configuredMax) : Number.NaN
+      if (!Number.isSafeInteger(parsedMax) || parsedMax < 0) throw new StoreError('TENANT_CONFIG_INVALID', 503)
       return ok(this.store.resolveTenant(identity, {
-        maxTenants: Number.isSafeInteger(parsedMax) && parsedMax > 0 && parsedMax <= 100 ? parsedMax : 10,
+        maxTenants: parsedMax,
         ...(this.env.DSH_SERVER_LEGACY_OWNER_SUBJECT ? { legacyOwnerSubject: this.env.DSH_SERVER_LEGACY_OWNER_SUBJECT } : {}),
         ...(this.env.DSH_SERVER_LEGACY_OWNER_ISSUER ? { legacyOwnerIssuer: this.env.DSH_SERVER_LEGACY_OWNER_ISSUER } : {}),
         legacyAccount: this.env.DSH_SERVER_ACCOUNT,

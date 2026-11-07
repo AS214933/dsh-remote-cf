@@ -1,4 +1,4 @@
-# 运维、十人内使用与 Git 自动部署
+# 运维、用量估算与 Git 自动部署
 
 核对日期：2026-11-07。以下是官方公开定价与模型估算，不是账单承诺。
 实际以所在 Cloudflare 账户计划、仪表盘用量和最新官方条款为准。
@@ -7,8 +7,11 @@
 
 当前服务按已验证的稳定 `issuer + sub` 建立独立租户，设备、凭据、在线状态和连接操作
 受认证租户范围约束，但 **所有租户仍共用一个 Gateway DO／SQLite／事件循环**。
-这不是每用户一个DO、物理数据库或独立配额。默认租户记录容量十个，禁用用户也计数，
-原所有者绑定前保留一个位置；详见[多租户与迁移](MULTITENANCY.md)。
+这不是每用户一个DO、物理数据库或独立配额。默认不设账号记录数量上限：
+`DSH_SERVER_MAX_TENANTS`未设置、空值或`0`均表示不限制该记录数量；也可显式设置安全正整数
+作为可选上限。仅在启用正整数上限时，禁用用户计数且原所有者绑定前保留一个位置。
+非法值拒绝为`503 / TENANT_CONFIG_INVALID`，不会静默回退为不限或十个。
+每租户／全局资源边界和Cloudflare配额仍有效，详见[多租户与迁移](MULTITENANCY.md)。
 
 默认准入仍是已验证邮箱允许列表。显式`DSH_SERVER_OIDC_ADMISSION=application`信任Logto
 应用访问策略，**服务端不检查角色声明**；必须先正确配置应用准入。生产共享建议仅OIDC，
@@ -42,10 +45,11 @@ DO定价文档说明：免费日限额00:00UTC重置，超出某类后该类操�
 [Realtime pricing](https://developers.cloudflare.com/realtime/sfu/platform/pricing/)、
 [Builds pricing](https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/)。
 
-## 怎么估算十人以内
+## 示例：十位用户的用量估算
 
-先按当前**十个逻辑租户、一个共享Gateway**估算；再单列每用户独立DO的替代方案。
-租户容量上限不是免费承诺，当前每租户活动边界与全局peer/link上限见[架构](ARCHITECTURE.md#limits-and-security-boundaries)。
+下文以**十个逻辑租户、一个共享Gateway**作为便于理解的用量示例，**不是账号数量上限**；
+再单列每用户独立DO的替代方案。默认不设账号记录数量上限，也不意味着无限资源或免费承诺。
+当前每租户活动边界与全局peer/link上限见[架构](ARCHITECTURE.md#limits-and-security-boundaries)。
 
 ### 当前单 Gateway：待机、LAN/P2P 为主
 
@@ -137,7 +141,7 @@ npm run deploy -- --config wrangler.build.local.jsonc
 | `LOGTO_ENDPOINT` / `LOGTO_CLIENT_ID` | 使用OIDC时设置；tenant根地址无`/oidc` |
 | `DSH_SERVER_ALLOW_CONCURRENT_HOSTS` | 可选并发Host策略 |
 | `DSH_SERVER_OIDC_ADMISSION` / `OAUTH_ALLOWED_ACCOUNTS` | 默认允许列表或显式`application`；后者依赖Logto应用访问策略，不检查角色 |
-| `DSH_SERVER_MAX_TENANTS` | 租户记录容量，默认10，非每用户资源保证 |
+| `DSH_SERVER_MAX_TENANTS` | 未设置／空值／`0`默认不设账号记录数量上限；可选安全正整数上限；非法值503拒绝，非资源保证 |
 | `DSH_SERVER_LEGACY_OWNER_ISSUER` / `DSH_SERVER_LEGACY_OWNER_SUBJECT` | 私有所有者精确身份固定；不要提交或公开 |
 | `DSH_SERVER_IDENTITY_ENROLLMENT_ONLY` | 仅监督身份登记阶段设`1`，完成后移除 |
 

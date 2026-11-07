@@ -4,7 +4,7 @@
 
 A Cloudflare Workers implementation of the DSH Remote server: REST authentication and device APIs, a hibernating Durable Object WebSocket gateway, encrypted Relay forwarding, and optional Cloudflare Realtime TURN credentials.
 
-> **OIDC multi-tenancy with logical isolation.** Verified `issuer + sub` identities receive separate device/credential namespaces, with a default capacity of ten tenant records. The current implementation keeps **one shared Gateway Durable Object**, not one process/database or quota allocation per user. Admission, original-owner migration and shared-resource limits must be configured before inviting users; see [multi-tenancy](docs/MULTITENANCY.md).
+> **OIDC multi-tenancy with logical isolation.** Verified `issuer + sub` identities receive separate device/credential namespaces. Tenant records have **no account-count cap by default** (`DSH_SERVER_MAX_TENANTS=0`); an optional positive cap can be configured. The current implementation keeps **one shared Gateway Durable Object**, not one process/database or quota allocation per user. Per-tenant/global resource bounds and Cloudflare quotas still apply. Configure admission and original-owner migration before inviting users; see [multi-tenancy](docs/MULTITENANCY.md).
 
 ## Start here
 

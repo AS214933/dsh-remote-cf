@@ -10,6 +10,7 @@
 - [ ] Register the exact callback, for example `https://remote.example.com/api/v1/auth/oauth/logto/callback`.
 - [ ] Set the client secret through the same explicit private `--config` target as deployment.
 - [ ] Confirm boolean `email_verified: true` and choose default allowlist or explicit Logto application admission; application mode does not enforce a server-side role claim.
+- [ ] Review account-record policy: unset/empty/`0` `DSH_SERVER_MAX_TENANTS` means no count cap; only an explicit safe positive integer enables a cap and reserved owner slot until binding. Invalid values must reject with `503 / TENANT_CONFIG_INVALID`. Resource bounds/platform quotas remain.
 - [ ] Enable query-string redaction and restrict access/retention for OAuth logs. QR IDs in paths and custom log fields require separate care.
 
 ## Isolated code checks

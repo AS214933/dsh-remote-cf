@@ -32,7 +32,7 @@ Do not hard-code the test count as a guarantee; use the result of the exact revi
 | Gateway lifecycle Vitest suite | Actual Gateway handlers with controlled sockets/store/runtime base, restored attachments, replacement ownership and deadline behavior |
 | TURN cache Vitest suite | Singleflight, per-device separation, capacity, fixed TTL/margin, failures and stale-flight ownership |
 | Logto / OAuth lifecycle Vitest suites | Signed test ID tokens, admission/enrollment policy, SDK request shape, real in-memory SQLite flow migration, one-shot claim/collection and expiry |
-| Tenant Store / Worker / Gateway / session suites | Stable issuer/subject identity, tenant-bound principals/credentials, owner pin/migration, capacity bounds and cross-tenant negative paths |
+| Tenant Store / Worker / Gateway / session suites | Stable issuer/subject identity, tenant-bound principals/credentials, owner pin/migration, no account-count cap by default (`0`), optional positive cap/invalid-config rejection, resource bounds and cross-tenant negative paths |
 | `test:runtime` | Real Miniflare/workerd Gateway, controlled credential issuer and explicit hibernation/wake cycles |
 | `test:oauth-runtime` | Real workerd QR/direct callback with a synthetic ES384 provider, PKCE, confidential authentication, nonce, browser state and session authorization |
 | `test:tenant-runtime` | Real workerd two-user isolation checks in the current singleton Gateway model, using disposable local state |
@@ -92,7 +92,7 @@ Use a separately controlled staging deployment and disposable devices. Recommend
 3. A real authorized user completing Logto login through a supported client.
 4. Supervised original-owner identity evidence/pin and preserved membership/device access, following [migration](MULTITENANCY.md#original-owner-migration); no first-login/email ownership inference.
 5. Two distinct issuer/subject users, separate device lists/credentials/peers, allowed same-tenant operations and denied cross-tenant API, WS, Relay/signaling and TURN paths. Reuse a synthetic device ID across tenants to exercise composite scoping where the client contract permits.
-6. Application admission behavior under the real Logto app access policy (no server-side role claim check), default allowlist rejection, tenant cap and enrollment-only normal-login rejection.
+6. Application admission behavior under the real Logto app access policy (no server-side role claim check), default allowlist rejection, unset/empty/`0` no-account-count-cap behavior, optional safe positive cap (including owner reservation only then), invalid setting `503 / TENANT_CONFIG_INVALID`, and enrollment-only normal-login rejection.
 7. Device registration, descriptor/pinning and the client's encrypted tunnel; LAN/P2P and, where required, explicitly forced TURN data-channel traffic—not only credential issuance.
 8. Tenant-scoped refresh replay/revocation, reconnect, deployment interruption and sustained/network-change behavior. Use only a tenant-aware rollback revision after onboarding.
 

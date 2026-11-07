@@ -133,13 +133,27 @@ describe('tenant store migration and identity binding', () => {
     expect(() => store.resolveTenant(identity('fourth'), capped)).toThrow('TENANT_LIMIT_REACHED')
   })
 
+  it('admits more than ten and one hundred distinct users when account count is unlimited', () => {
+    const { store, database } = fixture(), unlimited = { ...options, maxTenants: 0 }
+    for (let index = 0; index < 125; index++) {
+      const id = String(index).padStart(5, '0')
+      const admitted = store.resolveTenant(identity(id), unlimited)
+      expect(admitted.subject).toBe(`sub-${id}`)
+    }
+    const owner = store.resolveTenant(identity('owner', { subject: options.legacyOwnerSubject }), unlimited)
+    expect(owner.tenantId).toBe(LEGACY_TENANT_ID)
+    database.sql.exec('UPDATE tenants SET active=0 WHERE tenant_id=?', identity('00000').tenantId)
+    expect(() => store.resolveTenant(identity('00000'), unlimited)).toThrow('TENANT_DISABLED')
+    expect(store.resolveTenant(identity('new-after-disabled'), unlimited).subject).toBe('sub-new-after-disabled')
+  })
+
   it('counts claimed legacy once and permits existing tenants when the cap is lowered', () => {
     const { store } = fixture(), capped = { ...options, maxTenants: 1 }
     const ownerIdentity = identity('owner', { subject: options.legacyOwnerSubject })
     const owner = store.resolveTenant(ownerIdentity, capped)
     expect(store.resolveTenant(ownerIdentity, capped)).toEqual(owner)
     expect(() => store.resolveTenant(identity('extra'), capped)).toThrow('TENANT_LIMIT_REACHED')
-    expect(() => store.resolveTenant(identity('bad'), { ...options, maxTenants: 0 })).toThrow('TENANT_CONFIG_INVALID')
+    expect(() => store.resolveTenant(identity('bad'), { ...options, maxTenants: -1 })).toThrow('TENANT_CONFIG_INVALID')
   })
 
   it('rolls back registry initialization and allocation on insertion failure, then can retry safely', () => {

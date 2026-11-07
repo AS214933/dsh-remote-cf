@@ -2,7 +2,7 @@
 
 [README](../README.md) · [Multi-tenancy and migration](MULTITENANCY.md) · [Authentication](AUTHENTICATION.md) · [Operations](OPERATIONS.md)
 
-> One deployment now supports **logical OIDC tenants in one shared Gateway DO**, not per-user physical databases or resource reservations. Configure admission and original-owner migration before inviting users. The default capacity is ten tenant records; see the [tenant boundary and rollback gate](MULTITENANCY.md).
+> One deployment now supports **logical OIDC tenants in one shared Gateway DO**, not per-user physical databases or resource reservations. Configure admission and original-owner migration before inviting users. By default there is no account-record count cap (`DSH_SERVER_MAX_TENANTS=0`); per-tenant/global resource bounds and Cloudflare quotas remain. See the [tenant boundary and rollback gate](MULTITENANCY.md).
 
 Examples use reserved domains/synthetic values. Real endpoints, tenant subjects, Cloudflare IDs, device details and secrets belong only in private configuration or runtime Secrets—not tracked files.
 
@@ -37,7 +37,7 @@ This is a **fragment**, not a complete config:
     "DSH_SERVER_ACCOUNT": "owner@example.com",
     "DSH_SERVER_PUBLIC_URL": "https://remote.example.com",
     "DSH_SERVER_PASSWORD_LOGIN": "disabled",
-    "DSH_SERVER_MAX_TENANTS": "10",
+    "DSH_SERVER_MAX_TENANTS": "0",
     "DSH_SERVER_OIDC_ADMISSION": "allowlist"
   }
 }
@@ -97,7 +97,7 @@ Set nonsecret identity/admission settings in the ignored config:
   "LOGTO_ENDPOINT": "https://auth.example.com",
   "LOGTO_CLIENT_ID": "your-confidential-app-id",
   "DSH_SERVER_PASSWORD_LOGIN": "disabled",
-  "DSH_SERVER_MAX_TENANTS": "10",
+  "DSH_SERVER_MAX_TENANTS": "0",
   "DSH_SERVER_OIDC_ADMISSION": "allowlist"
 }
 ```
@@ -108,7 +108,7 @@ npx wrangler secret put LOGTO_CLIENT_SECRET --config wrangler.local.jsonc
 
 - Default/unrecognized admission retains the verified-email allowlist. Default email is `DSH_SERVER_ACCOUNT`; `OAUTH_ALLOWED_ACCOUNTS` can replace it. Distinct verified issuer/subject identities become separate logical tenants.
 - To trust Logto app-level admission, explicitly set `DSH_SERVER_OIDC_ADMISSION=application`. Configure and test the app access policy first. **No server-side roles-claim check is performed**; assigning a Logto role alone is not the required policy.
-- `DSH_SERVER_MAX_TENANTS` defaults ten; disabled records count and a reserved owner slot remains until binding.
+- `DSH_SERVER_MAX_TENANTS` unset, empty or `0` means no account-record count cap (default). Use an explicit safe positive integer only if a cap is desired; disabled records count and an owner slot is reserved until binding only under that cap. Invalid values fail closed with `503 / TENANT_CONFIG_INVALID`, not an unlimited/ten fallback. Per-tenant/global resource bounds and platform quotas are unchanged.
 - Verified email must be present and `email_verified === true`. Tenant ownership is stable issuer/subject, not email.
 - OIDC-only is recommended for shared production; no password-based multi-user registration is provided.
 

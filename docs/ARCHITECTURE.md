@@ -8,7 +8,7 @@ Verified OIDC `issuer + sub` maps to a stable tenant. Email must be verified for
 
 The current release deliberately retains **one singleton `Gateway` Durable Object** so existing opaque device credentials and first-frame WebSocket authentication remain compatible with clients. Isolation is enforced in authenticated application scope, not by separate processes, physical databases or Cloudflare quota allocations. SQL device keys include `(tenant_id, device_id)`; credential digests resolve their own tenant. A caller-supplied tenant ID in a header/query/body cannot select another partition.
 
-Tenant scope applies to sessions, registry checks, device lists/mutations, peer key lookups, owned-Host registration, refresh/revoke, WS peers/links and snapshots, Relay/signaling targets and TURN cache ownership. Default/unrecognized OIDC admission uses the verified-email allowlist; explicit `application` admission trusts configured Logto application access policy and **does not validate a roles claim**. Tenant-record capacity defaults to ten, including disabled users, with an owner slot reserved until binding.
+Tenant scope applies to sessions, registry checks, device lists/mutations, peer key lookups, owned-Host registration, refresh/revoke, WS peers/links and snapshots, Relay/signaling targets and TURN cache ownership. Default/unrecognized OIDC admission uses the verified-email allowlist; explicit `application` admission trusts configured Logto application access policy and **does not validate a roles claim**. Tenant records have no account-count cap by default: unset, empty or `0` `DSH_SERVER_MAX_TENANTS` is unlimited for that count only. An explicit safe positive integer enables a cap; disabled users count and an owner slot is reserved until binding only under that positive cap. Invalid settings fail closed with `503 / TENANT_CONFIG_INVALID`.
 
 See [multi-tenancy](MULTITENANCY.md) for exact identity/admission behavior, owner pinning, identity-only enrollment and the rollback gate. Per-user Worker/DO deployments remain an alternative for stronger resource separation; they are not the topology used by this release.
 
@@ -59,7 +59,7 @@ Workers do not run a TURN server. Another TURN implementation is not a drop-in b
 
 | Resource | Current bound |
 | --- | --- |
-| Tenant records | Default ten; disabled users count, owner slot reserved until binding |
+| Tenant records | No count cap by default (unset/empty/`0`); optional safe positive integer cap counts disabled users and reserves an owner slot until binding; invalid config fails `503 / TENANT_CONFIG_INVALID` |
 | Device rows / active credential rows | 64 / 1,024 per tenant |
 | Used-refresh replay markers | 50,000 per tenant, expiring with original refresh TTL |
 | Online peers / active links | 32 / 16 per tenant; global 256 peer/link ceilings |

@@ -25,8 +25,12 @@ snapshots, Relay/signaling targets and TURN caches all use authenticated scope.
   with a verified email. This **does not validate a roles claim**. Configure Logto
   application access policy correctly before enabling it. Assigning a role in
   Logto without a policy/claim check is not itself server-side authorization.
-- `DSH_SERVER_MAX_TENANTS` defaults10. One reserved slot remains for the original
-  owner until binding. Disabled users still count toward capacity.
+- `DSH_SERVER_MAX_TENANTS` unset, empty or `0` means **no account-record count
+  cap** (the default). An explicit safe positive integer enables an optional cap;
+  disabled users count toward that cap, and one original-owner slot is reserved
+  until binding **only when a positive cap is enabled**. Invalid values fail closed
+  with `503 / TENANT_CONFIG_INVALID`; they do not silently become `0` or ten.
+  Admission policy and the resource bounds below still apply without a record cap.
 - Password fallback, if enabled, belongs only to the reserved owner partition;
   it is not a password-based multi-user signup service. OIDC-only is recommended.
 

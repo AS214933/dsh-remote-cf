@@ -12,6 +12,9 @@ vi.mock('../src/store.js', () => ({
   Store: class {
     constructor(private storage: StateData) {}
     ensureLegacyTenant() { return { tenantId: 'legacy-owner' } }
+    resolveTenant(identity: Omit<TenantPrincipal, 'membershipId'>, options: { maxTenants: number }) {
+      return { ...identity, membershipId: `cap-${options.maxTenants}` }
+    }
     getTenant(tenant: string) { return this.storage.tenants.get(tenant) ?? null }
     getDevice(tenant: string, id: string) { return this.storage.devices.get(JSON.stringify([tenant, id])) ?? null }
     listDevices(tenant: string) { return [...this.storage.devices.values()].filter(row => row.tenant_id === tenant && !row.revoked) }
@@ -83,6 +86,21 @@ beforeEach(() => { vi.stubGlobal('WebSocket', Socket); vi.spyOn(console, 'warn')
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('Gateway tenant isolation', () => {
+  it('defaults to unlimited accounts, accepts explicit zero/large caps and rejects malformed configuration', async () => {
+    const f = await fixture(), identity = { tenantId: 'test-admission', account: 'test@example.com', issuer: 'https://auth.example.com/oidc', subject: 'test-admission' }
+    const mutableEnv = f.env as { DSH_SERVER_MAX_TENANTS?: string }
+    for (const [configured, expected] of [[undefined, 0], ['', 0], ['0', 0], [' 0 ', 0], ['1000', 1000], ['10', 10]] as const) {
+      if (configured === undefined) delete mutableEnv.DSH_SERVER_MAX_TENANTS
+      else mutableEnv.DSH_SERVER_MAX_TENANTS = configured
+      const result = await f.wake().resolveTenant(identity)
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.value.membershipId).toBe(`cap-${expected}`)
+    }
+    for (const configured of ['-1', '1.5', 'unlimited', 'Infinity', '1e3', '9007199254740992']) {
+      mutableEnv.DSH_SERVER_MAX_TENANTS = configured
+      expect(await f.wake().resolveTenant(identity)).toMatchObject({ ok: false, code: 'TENANT_CONFIG_INVALID', status: 503 })
+    }
+  })
   it('rejects an older issuing generation when same-device registration overtakes its hash await', async () => {
     const f = await fixture(), gateway = f.wake(), original = crypto.subtle.digest.bind(crypto.subtle)
     let release!: () => void

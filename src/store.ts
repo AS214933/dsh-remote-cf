@@ -69,6 +69,7 @@ interface TenantRow extends Record<string, SqlStorageValue> {
 }
 
 interface ResolveTenantOptions {
+  /** Zero disables account-count limits; positive integers opt into a record cap. */
   maxTenants: number
   legacyOwnerSubject?: string
   legacyOwnerIssuer?: string
@@ -262,7 +263,7 @@ export class Store {
   resolveTenant(identity: TenantIdentity, options: ResolveTenantOptions): TenantPrincipal {
     if (!nonempty(identity.tenantId) || identity.tenantId.length > 256 || !nonempty(identity.account)
       || !nonempty(identity.issuer) || !nonempty(identity.subject)
-      || !Number.isSafeInteger(options.maxTenants) || options.maxTenants < 1) throw new StoreError('TENANT_CONFIG_INVALID', 503)
+      || !Number.isSafeInteger(options.maxTenants) || options.maxTenants < 0) throw new StoreError('TENANT_CONFIG_INVALID', 503)
     return this.storage.transactionSync(() => {
       this.ensureLegacyTenantSync(options.legacyAccount, options.legacyMembershipId)
       const known = this.sql.exec<TenantRow>('SELECT * FROM tenants WHERE issuer = ? AND subject = ?', identity.issuer, identity.subject).toArray()[0]
@@ -280,12 +281,13 @@ export class Store {
       if (ownerPinMatches && legacy.active !== 1) throw new StoreError('TENANT_DISABLED', 403)
       if (ownerPinMatches && (legacy.issuer !== '' || legacy.subject !== '')) throw new StoreError('TENANT_IDENTITY_MISMATCH', 409)
       if (!ownerPinMatches && this.tenantRow(identity.tenantId) !== null) throw new StoreError('TENANT_IDENTITY_MISMATCH', 409)
-      // An unbound reserved legacy row is not a user. Disabled bound rows still
-      // count, so deactivation cannot be used to bypass the configured account cap.
-      const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tenants WHERE issuer <> '' AND subject <> ''").toArray()[0]?.n ?? 0
-      // Keep one slot for the reserved owner until explicit subject enrollment.
-      const reservedOwnerSlots = !ownerPinMatches && legacy.issuer === '' && legacy.subject === '' ? 1 : 0
-      if (count >= options.maxTenants - reservedOwnerSlots) throw new StoreError('TENANT_LIMIT_REACHED', 403)
+      if (options.maxTenants > 0) {
+        // An explicit optional cap includes disabled principals and reserves the
+        // original owner's slot. Unlimited mode skips the count query entirely.
+        const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tenants WHERE issuer <> '' AND subject <> ''").toArray()[0]?.n ?? 0
+        const reservedOwnerSlots = !ownerPinMatches && legacy.issuer === '' && legacy.subject === '' ? 1 : 0
+        if (count >= options.maxTenants - reservedOwnerSlots) throw new StoreError('TENANT_LIMIT_REACHED', 403)
+      }
       if (ownerPinMatches) {
         this.sql.exec('UPDATE tenants SET issuer = ?, subject = ?, account = ? WHERE tenant_id = ?', identity.issuer, identity.subject, identity.account, LEGACY_TENANT_ID)
         return principal(this.tenantRow(LEGACY_TENANT_ID)!)

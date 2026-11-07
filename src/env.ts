@@ -61,7 +61,7 @@ export interface Env {
   readonly OAUTH_ALLOWED_ACCOUNTS?: string
   /** `application` trusts successful verified-email authentication to this OIDC app; default is explicit email allowlist. */
   readonly DSH_SERVER_OIDC_ADMISSION?: 'application' | 'allowlist'
-  /** Maximum bound user principals in this deployment, default10 (global resource ceilings still apply). */
+  /** Optional bound-user cap: unset/empty/0 means unlimited; positive safe integer sets a cap. Resource ceilings still apply. */
   readonly DSH_SERVER_MAX_TENANTS?: string
   /** Explicit stable OIDC identity allowed to bind the reserved legacy owner partition. Never inferred from email. */
   readonly DSH_SERVER_LEGACY_OWNER_SUBJECT?: string

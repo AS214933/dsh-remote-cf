@@ -18,7 +18,7 @@ const runtime = new Miniflare(convertV4MiniflareOptions({ name: 'tenant-runtime-
   bindings: { DSH_SERVER_ACCOUNT: 'legacy@example.com', DSH_SERVER_PASSWORD: 'synthetic-password', DSH_SERVER_PASSWORD_LOGIN: 'disabled',
     DSH_SERVER_PUBLIC_URL: origin, SESSION_SECRET: 'tenant-runtime-session-secret-long-enough',
     LOGTO_ENDPOINT: endpoint, LOGTO_CLIENT_ID: app, LOGTO_CLIENT_SECRET: secret, DSH_SERVER_OIDC_ADMISSION: 'application',
-    DSH_SERVER_MAX_TENANTS: '10', TURN_KEY_ID: 'synthetic-turn-key', TURN_KEY_API_TOKEN: 'synthetic-turn-token' },
+    DSH_SERVER_MAX_TENANTS: '0', TURN_KEY_ID: 'synthetic-turn-key', TURN_KEY_API_TOKEN: 'synthetic-turn-token' },
   outboundService: async request => {
     const url = new URL(request.url)
     if (url.hostname === 'rtc.live.cloudflare.com') {
@@ -113,6 +113,12 @@ async function createLink(host, client) {
 try {
   const a = await login('subject-a', 'a@example.com'), b = await login('subject-b', 'b@example.com')
   assert.notEqual(a.tenantId, b.tenantId)
+  for (let index = 0; index < 12; index++) {
+    const extra = await login(`unlimited-extra-${index}`, `extra-${index}@example.com`)
+    assert.notEqual(extra.tenantId, a.tenantId)
+    assert.deepEqual((await json('/api/v1/account/devices', extra.token)).items, [])
+  }
+  console.log('PASS: real workerd admits more than ten independent OIDC accounts with zero account-count cap')
   const sharedHost = '00000000-0000-4000-8000-000000000001', sharedClient = '00000000-0000-4000-8000-000000000002'
   const bOnly = '00000000-0000-4000-8000-000000000003'
   const aHost = await register(a, sharedHost, 'host', 'a-host'), aClient = await register(a, sharedClient, 'client', 'a-client')

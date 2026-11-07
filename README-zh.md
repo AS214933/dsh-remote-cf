@@ -4,7 +4,7 @@
 
 DSH Remote 服务端的 Cloudflare Workers 实现：REST 认证与设备 API、支持休眠的 Durable Object WebSocket 网关、加密 Relay 转发，以及可选的 Cloudflare Realtime TURN 凭据签发。
 
-> **现已支持 OIDC 多租户逻辑隔离。** 经验证的 `issuer + sub` 身份拥有独立设备／凭据命名空间，租户记录容量默认十个。当前仍共用**一个 Gateway Durable Object**，不是每用户独立进程、物理数据库或免费配额。邀请用户前必须配置准入、原所有者迁移和共享资源边界，详见[多租户](docs/MULTITENANCY.md)。
+> **现已支持 OIDC 多租户逻辑隔离。** 经验证的 `issuer + sub` 身份拥有独立设备／凭据命名空间，**默认不设账号记录数量上限**（`DSH_SERVER_MAX_TENANTS=0`），也可显式配置正整数上限。当前仍共用**一个 Gateway Durable Object**，不是每用户独立进程、物理数据库或免费配额；每租户／全局资源限制及 Cloudflare 配额仍有效。邀请用户前必须配置准入和原所有者迁移，详见[多租户](docs/MULTITENANCY.md)。
 
 ## 文档入口
 
