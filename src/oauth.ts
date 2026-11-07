@@ -6,8 +6,7 @@
  * it. That means any OAuth 2.0 provider works without touching a client — GitHub,
  * GitLab, Logto, Keycloak, Auth0.
  *
- * Verified against the reference server (`service2.example.com`), which returns both `startUrl`
- * and `qrStartUrl` for every provider. `scanUrl` is not an image: it is a redirect page,
+ * The reference server returns both `startUrl` and `qrStartUrl` for every provider. `scanUrl` is not an image: it is a redirect page,
  * so scanning the code and clicking "open in browser" walk the same path.
  */
 import type { Env } from './env.js'
