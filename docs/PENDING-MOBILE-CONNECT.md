@@ -19,7 +19,7 @@ The implementation now restores snapshots before processing wake events, saves n
 
 Lifecycle tests call actual Gateway handlers with controlled sockets/store/runtime base. Separate real workerd tests explicitly hibernate/wake the object and cover first-event routing, pending/accepted/handshake stages, ready Relay cycles, replay rejection and close-event notification.
 
-Historical Git source revision `5eb8da7` can be used as a failing comparison for the wake-routing case when available. That is a source revision, not an instance deployment ID. A regression comparison should retain the same test scenario and assertion, not infer success from missing log lines.
+Historical Git source revision `d8cbf6a` can be used as a failing comparison for the wake-routing case when available. That is a source revision, not an instance deployment ID. A regression comparison should retain the same test scenario and assertion, not infer success from missing log lines.
 
 These tests use disposable local state. They do not by themselves prove native Noise compatibility, real-phone behavior, network-change recovery, a forced TURN data path or long-term production stability. Instant successful reconnection is narrower evidence than overnight/network-change acceptance.
 

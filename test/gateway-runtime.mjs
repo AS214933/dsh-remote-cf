@@ -7,7 +7,7 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import { build } from 'esbuild'
 import { execFileSync } from 'node:child_process'
 
-// Optional historical control: GATEWAY_SOURCE_REF=5eb8da7 must fail after eviction.
+// Optional historical control: GATEWAY_SOURCE_REF=d8cbf6a must fail after eviction.
 const baseline = process.env.GATEWAY_SOURCE_REF
 // Performance control loads the complete pre-optimization setup path.
 const setupBaseline = process.env.SETUP_SOURCE_REF

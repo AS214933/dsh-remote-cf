@@ -94,7 +94,7 @@ Do not enter another person's password/OTP or create unattended production devic
 The Gateway runtime can compare prior setup behavior with the optimized path when the named Git revision is available:
 
 ```bash
-SETUP_SOURCE_REF=0dee93f node test/gateway-runtime.mjs
+SETUP_SOURCE_REF=8e07c6d node test/gateway-runtime.mjs
 ```
 
 This uses a historical source control revision, not a deployment identifier. A synthetic delayed issuer isolates server waiting and cannot predict a phone's end-to-end setup time. See the [latency guide](CONNECTION-LATENCY.md) for sample boundaries and cache trade-offs.

@@ -25,7 +25,7 @@ The cache is deliberately memory-only. Hibernation/redeployment discards it whil
 
 ## Isolated benchmark
 
-The real workerd/Miniflare comparison uses a synthetic issuer taking 150 ms per call, the same sequential client-then-Host endpoint order and disposable local state. The control loads setup code from Git revision `0dee93f`; it is not an operator deployment version.
+The real workerd/Miniflare comparison uses a synthetic issuer taking 150 ms per call, the same sequential client-then-Host endpoint order and disposable local state. The control loads setup code from Git revision `8e07c6d`; it is not an operator deployment version.
 
 | Local sample | Previous | Optimized |
 | --- | ---: | ---: |
@@ -45,7 +45,7 @@ npm run test:runtime
 When the historical Git revision is present, the comparison can be run with:
 
 ```bash
-SETUP_SOURCE_REF=0dee93f node test/gateway-runtime.mjs
+SETUP_SOURCE_REF=8e07c6d node test/gateway-runtime.mjs
 ```
 
 ## Validation boundaries
