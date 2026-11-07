@@ -22,12 +22,21 @@ describe('private Workers Builds configuration', () => {
         DSH_BUILD_WORKER_NAME: 'test-worker', DSH_SERVER_PUBLIC_URL: 'https://remote.example.com',
         DSH_SERVER_ACCOUNT: 'owner@example.com', DSH_SERVER_PASSWORD_LOGIN: 'disabled',
         SESSION_SECRET: 'must-not-copy-runtime-secret', LOGTO_CLIENT_SECRET: 'must-not-copy-runtime-secret',
+        DSH_SERVER_IDENTITY_PROBE_KEY: 'must-not-copy-runtime-secret', DSH_SERVER_IDENTITY_EVIDENCE_KEY: 'must-not-copy-runtime-secret', DSH_SERVER_OIDC_ADMISSION: 'application',
+        DSH_SERVER_MAX_TENANTS: '10', DSH_SERVER_LEGACY_OWNER_SUBJECT: 'synthetic-owner-subject',
+        DSH_SERVER_LEGACY_OWNER_ISSUER: 'https://auth.example.com/oidc', DSH_SERVER_IDENTITY_ENROLLMENT_ONLY: '1',
       } })
       expect(run.status).toBe(0)
       const text = readFileSync(path.join(cwd, 'wrangler.build.local.jsonc'), 'utf8')
       const config = JSON.parse(text)
       expect(config.name).toBe('test-worker')
       expect(config.vars.DSH_SERVER_PASSWORD_LOGIN).toBe('disabled')
+      expect(config.vars.DSH_SERVER_OIDC_ADMISSION).toBe('application')
+      expect(config.vars.DSH_SERVER_MAX_TENANTS).toBe('10')
+      expect(config.vars.DSH_SERVER_LEGACY_OWNER_SUBJECT).toBe('synthetic-owner-subject')
+      expect(config.vars.DSH_SERVER_LEGACY_OWNER_ISSUER).toBe('https://auth.example.com/oidc')
+      expect(config.vars.DSH_SERVER_IDENTITY_ENROLLMENT_ONLY).toBe('1')
+      expect(config.vars.DSH_SERVER_IDENTITY_PROBE_KEY).toBeUndefined()
       expect(config.observability.redact_query_string).toBe(true)
       expect(config.durable_objects.bindings[0]).toEqual({ name: 'GATEWAY', class_name: 'Gateway' })
       expect(text).not.toContain('must-not-copy-runtime-secret')

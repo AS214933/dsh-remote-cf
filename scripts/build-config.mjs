@@ -18,10 +18,14 @@ if (publicUrl.protocol !== 'https:' || publicUrl.port || publicUrl.username || p
   throw new Error('Public URL must be an HTTPS origin')
 }
 const vars = { DSH_SERVER_ACCOUNT: required('DSH_SERVER_ACCOUNT'), DSH_SERVER_PUBLIC_URL: publicUrl.origin }
-for (const key of ['DSH_SERVER_PASSWORD_LOGIN', 'LOGTO_ENDPOINT', 'LOGTO_CLIENT_ID', 'DSH_SERVER_ALLOW_CONCURRENT_HOSTS', 'DSH_SERVER_ALLOWED_ORIGINS']) {
+for (const key of ['DSH_SERVER_PASSWORD_LOGIN', 'LOGTO_ENDPOINT', 'LOGTO_CLIENT_ID', 'OAUTH_ALLOWED_ACCOUNTS',
+  'DSH_SERVER_OIDC_ADMISSION', 'DSH_SERVER_MAX_TENANTS', 'DSH_SERVER_LEGACY_OWNER_ISSUER',
+  'DSH_SERVER_LEGACY_OWNER_SUBJECT', 'DSH_SERVER_IDENTITY_ENROLLMENT_ONLY',
+  'DSH_SERVER_ALLOW_CONCURRENT_HOSTS', 'DSH_SERVER_ALLOWED_ORIGINS']) {
   if (process.env[key]?.trim()) vars[key] = process.env[key].trim()
 }
-// This deployment remains single-account. Never interpret multiple emails as tenants.
+// Explicit application admission is opt-in. Stable tenant ownership is issuer+sub,
+// never any allowlist email. Enrollment capability stays a runtime Secret.
 const config = {
   $schema: 'node_modules/wrangler/config-schema.json', name, main: 'src/worker.ts',
   compatibility_date: '2026-04-07', compatibility_flags: ['nodejs_compat'],

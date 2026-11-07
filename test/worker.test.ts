@@ -128,7 +128,7 @@ describe('connection setup uses one authenticated Gateway RPC per critical looku
   })
 
   it('gets pinned peer and presence through the same fresh authorization operation', async () => {
-    const target = { deviceId: '00000000-0000-4000-8000-000000000001', role: 'host', name: 'test-host',
+    const target = { tenantId: 'test-tenant', membershipId: 'account:test', deviceId: '00000000-0000-4000-8000-000000000001', role: 'host', name: 'test-host',
       platform: 'test', identityKey: 'a'.repeat(43), clientVersion: '0.6.3', harnessVersion: null, online: true, lastSeenAt: 123 }
     const getAuthorizedPeer = vi.fn(async () => ({ ok: true, value: target }))
     const env = makeEnv({ GATEWAY: { getByName: () => ({ getAuthorizedPeer }) } as unknown as Env['GATEWAY'] })

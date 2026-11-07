@@ -36,10 +36,13 @@ function storage(db = new DatabaseSync(':memory:')) {
 function fixture() {
   const database = storage()
   const store = new Store(database)
+  const resolveIdentity = vi.fn(async identity => store.resolveTenant(identity, {
+    maxTenants: 10, legacyAccount: env.DSH_SERVER_ACCOUNT, legacyMembershipId: 'account:legacy-test',
+  }))
   const issueSession = vi.fn(async () => ({ token: 'local-session-token', expiresAt: Date.now() + 60_000 }))
   const call = vi.fn(async (method, args) => store[method](...args))
   const deps = {
-    call, issueSession, rate: vi.fn(), clientKey: () => 'test-client',
+    call, resolveIdentity, issueSession, rate: vi.fn(), clientKey: () => 'test-client',
     readJson: async request => request.json(),
     errorResponse: (code, status, headers) => Response.json({ error: { code } }, { status, headers }),
   }
@@ -197,7 +200,11 @@ describe('OAuth handlers with real signed provider tokens and local SQLite', () 
     expect(response.headers.get('Set-Cookie')).toContain('Max-Age=0')
     expect(response.headers.get('Set-Cookie')).toContain('Secure')
     expect(f.deps.issueSession).toHaveBeenCalledTimes(1)
-    expect(f.deps.issueSession).toHaveBeenCalledWith('owner@example.com')
+    expect(f.deps.resolveIdentity).toHaveBeenCalledTimes(1)
+    expect(f.deps.issueSession).toHaveBeenCalledWith(expect.objectContaining({ account: 'owner@example.com',
+      issuer: ISSUER, subject: 'local-user', tenantId: expect.stringMatching(/^[0-9a-f]{64}$/), membershipId: expect.any(String) }))
+    const principal = f.deps.issueSession.mock.calls[0][0]
+    expect(f.store.getTenant(principal.tenantId)).toEqual(principal)
     const poll = await pollSession(request(`/api/v1/auth/oauth/qr/${flow.qrId}`), env, f.deps, flow.qrId)
     privateResponse(poll)
     expect(await poll.json()).toEqual({ status: 'complete', token: 'local-session-token' })

@@ -7,15 +7,18 @@ vi.mock('../src/store.js', () => ({
   StoreError: class StoreError extends Error {},
   Store: class {
     constructor(private storage: { devices: Map<string, Record<string, unknown>>; token: Record<string, unknown> | null }) {}
-    getDevice(id: string) { return this.storage.devices.get(id) ?? null }
-    listDevices() { return [...this.storage.devices.values()] }
+    getTenant(tenantId: string) { return tenantId === 'legacy-owner' ? { tenantId, account: 'owner@example.com', membershipId: 'account:legacy', issuer: '', subject: '' } : null }
+    ensureLegacyTenant() { return this.getTenant('legacy-owner') }
+    getDevice(tenantId: string, id: string) { const device = this.storage.devices.get(id); return device?.tenant_id === tenantId ? device : null }
+    listDevices(tenantId: string) { return [...this.storage.devices.values()].filter(device => device.tenant_id === tenantId) }
     findToken() { return this.storage.token }
-    revokeDevice(id: string) { const device = this.getDevice(id); if (device) device.revoked = 1 }
+    revokeDevice(tenantId: string, id: string) { const device = this.getDevice(tenantId, id); if (device) device.revoked = 1 }
     touchDevice() {}
   },
 }))
 import { Gateway } from '../src/gateway.js'
 
+const TENANT = 'legacy-owner'
 const HOST = '00000000-0000-4000-8000-000000000001'
 const CLIENT = '00000000-0000-4000-8000-000000000002'
 const CLIENT_B = '00000000-0000-4000-8000-000000000003'
@@ -35,16 +38,16 @@ class Socket {
   close(code: number, reason: string) { this.closes.push({ code, reason }); this.readyState = Socket.CLOSED }
 }
 function peer(id: string, role: 'host' | 'client', extra: Record<string, unknown> = {}): Socket {
-  return new Socket({ state: 'authenticated', deviceId: id, role, capabilities: CAPS,
+  return new Socket({ state: 'authenticated', tenantId: TENANT, deviceId: id, role, capabilities: CAPS,
     version: '0.6.3', lastPong: Date.now(), connectedAt: Date.now(), sessionId: `session-${id}`, ...extra })
 }
 function fixture(sockets = [peer(HOST, 'host'), peer(CLIENT, 'client')]) {
   let alarm: number | null = null
   const devices = new Map([HOST, CLIENT, CLIENT_B].map(id => [id, {
-    device_id: id, role: id === HOST ? 'host' : 'client', revoked: 0,
+    tenant_id: TENANT, device_id: id, role: id === HOST ? 'host' : 'client', revoked: 0,
     client_version: '0.6.3', identity_key: 'a'.repeat(42) + 'A', last_seen_at: Date.now(),
   }]))
-  const storage = { devices, token: { device_id: CLIENT, kind: 'access', expires_at: Date.now() + 3_600_000 } as Record<string, unknown> | null,
+  const storage = { devices, token: { tenant_id: TENANT, device_id: CLIENT, kind: 'access', expires_at: Date.now() + 3_600_000 } as Record<string, unknown> | null,
     getAlarm: vi.fn(async () => alarm),
     setAlarm: vi.fn(async (value: number | Date) => { alarm = Number(value) }),
     deleteAlarm: vi.fn(async () => { alarm = null }) }
@@ -83,10 +86,32 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('Gateway hibernation and replacement lifecycle', () => {
+  it('refuses tenantless authenticated snapshots rather than assigning legacy ownership', async () => {
+    const stale = peer(CLIENT, 'client')
+    const attachment = stale.deserializeAttachment(); delete attachment.tenantId; stale.serializeAttachment(attachment)
+    const f = fixture([peer(HOST, 'host'), stale]), gateway = f.wake()
+    expect(stale.closes).toHaveLength(1)
+    expect(stale.closes[0]?.reason).toBe('AUTH_INVALID')
+    expect((await gateway.getDevice(TENANT, CLIENT))?.online).toBe(false)
+    expect((await gateway.getDevice(TENANT, HOST))?.online).toBe(true)
+    await f.message(gateway, stale, 'connect.request', { hostDeviceId: HOST, preferredTransports: ['relay'] })
+    expect(f.sockets[0]!.frames.filter(frame => frame.type === 'connect.incoming')).toHaveLength(0)
+  })
+
+  it('discards a cross-tenant link snapshot on wake instead of restoring shared routing', async () => {
+    const f = fixture(), gateway = f.wake(), id = await openLink(f, gateway)
+    const attachment = f.sockets[1]!.deserializeAttachment()
+    ;(attachment.link as Record<string, unknown>).tenantId = 'foreign-tenant'
+    f.sockets[1]!.serializeAttachment(attachment)
+    const restored = f.wake()
+    expect(f.sockets[1]!.deserializeAttachment().link).toBeUndefined()
+    expect(await restored.authorizeTurn(TENANT, CLIENT, id)).toBe(false)
+    expect(f.sockets.every(socket => socket.closes.length === 0)).toBe(true)
+  })
   it('restores authenticated peers before the first message or online-status RPC', async () => {
     const f = fixture()
     const gateway = f.wake()
-    expect((await gateway.getDevice(HOST))?.online).toBe(true)
+    expect((await gateway.getDevice(TENANT, HOST))?.online).toBe(true)
     await f.message(gateway, f.sockets[1]!, 'ping', { nonce: 'first-after-wake' })
     expect(f.sockets[1]!.frames.at(-1)).toMatchObject({ type: 'pong', payload: { nonce: 'first-after-wake' } })
     expect(f.sockets[1]!.closes).toEqual([])
@@ -100,14 +125,14 @@ describe('Gateway hibernation and replacement lifecycle', () => {
     await acceptLink(f, gateway, id)
     expect(f.sockets[1]!.frames.at(-1)?.type).toBe('connect.accepted')
     gateway = f.wake()
-    expect(await gateway.authorizeTurn(CLIENT, id)).toBe(true)
+    expect(await gateway.authorizeTurn(TENANT, CLIENT, id)).toBe(true)
     await f.message(gateway, f.sockets[1]!, 'signal.offer', { connectionId: id, targetDeviceId: HOST, sdp: 'offer' })
     expect(f.sockets[0]!.frames.at(-1)?.type).toBe('signal.offer')
     await f.message(gateway, f.sockets[1]!, 'secure.handshake', { connectionId: id, targetDeviceId: HOST, step: 1, data: 'AAAA' })
     gateway = f.wake()
     await f.message(gateway, f.sockets[0]!, 'secure.handshake', { connectionId: id, targetDeviceId: CLIENT, step: 2, data: 'AAAA' })
     expect(f.sockets[1]!.frames.at(-1)?.type).toBe('secure.handshake')
-    expect(await gateway.authorizeTurn(CLIENT, id)).toBe(false)
+    expect(await gateway.authorizeTurn(TENANT, CLIENT, id)).toBe(false)
   })
 
   it('prefetches both peer credentials concurrently without blocking acceptance, then reuses the host result', async () => {
@@ -145,7 +170,7 @@ describe('Gateway hibernation and replacement lifecycle', () => {
       const result = gateway.getIceServers('test', id)
       // The RPC must have passed its first auth check and joined the pending mint.
       await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(1))
-      if (scenario === 'revoked') await gateway.revokeDevice(CLIENT)
+      if (scenario === 'revoked') await gateway.revokeDevice(TENANT, CLIENT)
       if (scenario === 'token-expired') f.storage.token!.expires_at = Date.now() - 1
       if (scenario === 'token-rotated') f.storage.token = null
       if (scenario === 'closed') f.sockets[0]!.readyState = Socket.CLOSED
@@ -197,7 +222,7 @@ describe('Gateway hibernation and replacement lifecycle', () => {
     await acceptLink(f, gateway, id)
     await gateway.webSocketError(old as unknown as WebSocket)
     expect(f.sockets[1]!.closes).toEqual([])
-    expect(await gateway.authorizeTurn(CLIENT, id)).toBe(true)
+    expect(await gateway.authorizeTurn(TENANT, CLIENT, id)).toBe(true)
   })
 
   it('closes only the predecessor with 4003 for identity takeover, independent of socket age', async () => {
