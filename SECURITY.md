@@ -1,27 +1,21 @@
 # Security policy
 
-This is an independently maintained single-account server port. It has no security
-certification, managed service SLA, or supported multi-tenant isolation. Do not
-onboard unrelated users into one deployment's device pool; see
-[architecture](docs/ARCHITECTURE.md) and [authentication](docs/AUTHENTICATION.md).
+This independently maintained server port now provides **logical OIDC tenant isolation in one shared Gateway Durable Object**, keyed by verified issuer/subject rather than email. It does not provide separate processes/physical databases, reserved per-tenant quota, a managed SLA or independent security certification. Review [multi-tenancy and migration](docs/MULTITENANCY.md), [architecture](docs/ARCHITECTURE.md) and [authentication](docs/AUTHENTICATION.md) before sharing an instance.
 
 ## Reporting a vulnerability
 
-Use the repository's **Security → Report a vulnerability** private-reporting flow
-if enabled. Do not put exploit details, live URLs, tokens, device identifiers or
-logs in a public issue. If private reporting is unavailable, open a minimal issue
-requesting a private contact channel without sensitive details, or contact the
-maintainer through their published GitHub profile contact method.
+Use **Security → Report a vulnerability** if private reporting is enabled. Do not put exploit details, live URLs, tokens, tenant subjects, identity-enrollment evidence, device identifiers or raw logs in a public issue. If private reporting is unavailable, request a private channel without sensitive details, or use a published maintainer profile contact method.
 
-Include the source revision, synthetic reproduction steps, impact and affected
-configuration. Use disposable local accounts and test identities. Do not test
-against someone else's deployment or send real credentials as a reproduction.
+Include the exact source revision, synthetic reproduction, affected configuration and impact. Use disposable local identities/devices; cross-tenant reports should demonstrate unauthorized behavior with test tenants you control, not someone else's deployment or credentials.
 
 ## Operator responsibilities
 
-Keep runtime secrets out of Git and logs, restrict OIDC verified-email access,
-review dependency updates and account-wide Cloudflare quotas, protect deployment
-build settings and disable untrusted preview builds. Logout/cookie removal does
-not revoke all already issued bearer/device credentials. Rotate/revoke affected
-credentials when compromise is suspected; history rewriting alone is not
-revocation. See the [publication checklist](docs/PUBLICATION.md).
+- Keep runtime Secrets, private deployment identity, owner subject pins, probe capabilities and identity evidence out of Git/log sharing. Restrict deployment builds and untrusted previews.
+- Choose OIDC admission deliberately. Default is the verified-email allowlist; `application` trusts correctly configured Logto application access policy and **does not enforce a server-side roles claim**. The default ten-tenant record cap is not a security audit or resource reservation.
+- Prefer OIDC-only for shared production. Any enabled password fallback belongs only to the reserved original-owner partition; it is not multi-user password signup.
+- Supervise original-owner migration. Never infer ownership from matching email/first login. Identity-only enrollment must issue no ordinary session/device access. Evidence signing uses a separate operator-only Secret, never the URL probe capability; remove temporary enrollment Secrets/gate after verification.
+- **Never roll back to a pre-tenant binary after onboarding.** Older code ignores tenant scoping. Retained legacy backup tables do not make ordinary old-version rollback safe; follow the [tenant-aware rollback gate](docs/MULTITENANCY.md#deployment-and-rollback-gate).
+- Monitor account-wide Cloudflare quotas and singleton resource contention. Per-tenant access isolation/limits do not prevent every shared availability or billing impact.
+- Review dependency updates and test both same-tenant success and cross-tenant rejection. Synthetic tests are not proof of every client/network or an independent penetration test.
+
+Logout/cookie removal does not revoke every issued session/device/provider credential. Apply the relevant tenant/device revocation or key rotation when compromise is suspected and verify behavior; historical source cleanup is not credential revocation. See [revocation boundaries](docs/AUTHENTICATION.md#sessions-and-revocation) and [publication hygiene](docs/PUBLICATION.md).

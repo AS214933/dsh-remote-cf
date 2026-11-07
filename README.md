@@ -4,21 +4,22 @@
 
 A Cloudflare Workers implementation of the DSH Remote server: REST authentication and device APIs, a hibernating Durable Object WebSocket gateway, encrypted Relay forwarding, and optional Cloudflare Realtime TURN credentials.
 
-> **Single-account deployment, not multi-tenant hosting.** Password login and optional Logto OIDC authenticate access to one shared device namespace. Even a small group of up to ten people needing separate accounts and isolated devices is **not supported** by one instance. An OIDC email allowlist does not create tenant isolation. See [architecture and limits](docs/ARCHITECTURE.md#single-account-boundary).
+> **OIDC multi-tenancy with logical isolation.** Verified `issuer + sub` identities receive separate device/credential namespaces, with a default capacity of ten tenant records. The current implementation keeps **one shared Gateway Durable Object**, not one process/database or quota allocation per user. Admission, original-owner migration and shared-resource limits must be configured before inviting users; see [multi-tenancy](docs/MULTITENANCY.md).
 
 ## Start here
 
 | Guide | What to read |
 | --- | --- |
-| [Deployment](docs/DEPLOYMENT.md) | Private configuration copy, explicit Wrangler target, secrets and first deployment |
-| [Authentication](docs/AUTHENTICATION.md) | Password, Logto OIDC, OIDC-only mode, verified email and revocation limits |
-| [Architecture](docs/ARCHITECTURE.md) | Single-account trust boundary, transports, storage, default 418 and known limits |
+| [Deployment](docs/DEPLOYMENT.md) | Private configuration, explicit Wrangler target, secrets and rollout |
+| [Multi-tenancy](docs/MULTITENANCY.md) | Stable identity, admission policy, owner enrollment/migration and rollback gate |
+| [Authentication](docs/AUTHENTICATION.md) | Logto OIDC, OIDC-only mode, legacy-owner password fallback and revocation |
+| [Architecture](docs/ARCHITECTURE.md) | Logical tenant boundary, shared Gateway, transports, storage and limits |
 | [Testing](docs/TESTING.md) | Isolated unit/workerd checks and boundaries of legacy live diagnostics |
 | [Connection latency](docs/CONNECTION-LATENCY.md) | Server-side RPC reduction and bounded TURN credential reuse |
-| [Operations](docs/OPERATIONS.md) | Platform costs, quotas and Git deployment operations |
+| [Operations](docs/OPERATIONS.md) | Platform costs, singleton-versus-per-user estimates and Git deployment |
 | [Publication](docs/PUBLICATION.md) | Public-repository preparation and release hygiene |
 
-For a local checkout, use a supported modern Node.js release (at least 22.13; see the testing guide):
+Use a supported modern Node.js release (at least 22.13; see the testing guide):
 
 ```bash
 npm ci
@@ -26,20 +27,22 @@ npm run typecheck
 npm test
 npm run test:runtime
 npm run test:oauth-runtime
+npm run test:tenant-runtime
+npm run test:enrollment-runtime
 ```
 
 Deployment is intentionally not a bare `npm run deploy` recipe: use the ignored local configuration and explicit `--config` commands in the [deployment guide](docs/DEPLOYMENT.md). No public service endpoint or credentials are provided by this repository.
 
 ## Scope
 
-- Supports device registration, access/refresh credentials, presence and connection signaling.
-- Forwards end-to-end encrypted session traffic; it still handles authentication material and connection metadata. This is not an independent security certification.
-- Coordinates LAN/P2P, TURN-assisted WebRTC and encrypted server Relay. A credential-issuance check is not proof of a working TURN data path.
-- Defaults to HTTP **418** for the root and unrelated routes. The bundled static asset is a placeholder, not a Remote web workbench.
-- Does not promise zero cost, unrestricted capacity, full upstream parity or compatibility with every client revision. Review [operations](docs/OPERATIONS.md), [testing](docs/TESTING.md) and [limits](docs/ARCHITECTURE.md#limits-and-security-boundaries).
+- Tenant-scoped device registration, access/refresh credentials, presence, signaling and encrypted Relay.
+- OIDC identities use stable issuer/subject keys; verified email is admission/display metadata, not an ownership key. Application admission trusts configured Logto app access policy, **not a server-side role check**.
+- LAN/P2P, TURN-assisted WebRTC and encrypted server Relay; credential issuance is not proof of a working TURN data path.
+- Root/unrelated routes default to HTTP **418**. The bundled asset is a placeholder, not a Remote web workbench.
+- No zero-cost, reserved per-tenant capacity, full-upstream-parity or independent security-certification promise. Review [shared limits](docs/ARCHITECTURE.md#limits-and-security-boundaries) and the [migration/rollback gate](docs/MULTITENANCY.md#deployment-and-rollback-gate).
 
 ## Origin and license
 
-The canonical project is [liguobao/ds-harness-remote](https://github.com/liguobao/ds-harness-remote); the [AS214933 fork](https://github.com/AS214933/ds-harness-remote) is also used as a protocol reference. This repository is an independent Workers implementation, not an official upstream service.
+The canonical project is [liguobao/ds-harness-remote](https://github.com/liguobao/ds-harness-remote); the [AS214933 fork](https://github.com/AS214933/ds-harness-remote) is also a protocol reference. This is an independent Workers implementation, not an official upstream service.
 
-This repository declares MIT; see [LICENSE](LICENSE). That declaration does not replace applicable upstream or dependency notices for copied, adapted or bundled material. Source attribution and distribution requirements are covered in the [architecture guide](docs/ARCHITECTURE.md#source-origin-and-licensing).
+This repository declares MIT; see [LICENSE](LICENSE). That does not replace applicable upstream/dependency notices for copied, adapted or bundled material. See [source attribution](docs/ARCHITECTURE.md#source-origin-and-licensing).

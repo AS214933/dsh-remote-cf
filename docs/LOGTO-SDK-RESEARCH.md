@@ -31,4 +31,4 @@ The current Logto/OAuth unit suites inspect actual SDK request shapes and locall
 
 Old test filenames, total counts, “not deployed yet” statements and a generic OAuth mock are not evidence for the current implementation. Pin and inspect the installed SDK when upgrading rather than applying this note as a timeless statement about every Logto package/version.
 
-The choice of SDK, accepted email or IdP does not change this server's [single shared-account model](ARCHITECTURE.md#single-account-boundary).
+The SDK alone does not establish isolation. The current port separately implements [logical OIDC tenancy and explicit legacy-owner migration](MULTITENANCY.md), keyed by verified issuer/subject rather than email.

@@ -1,82 +1,71 @@
 # Authentication
 
-[README](../README.md) · [Deployment](DEPLOYMENT.md) · [Architecture](ARCHITECTURE.md)
+[README](../README.md) · [Multi-tenancy and migration](MULTITENANCY.md) · [Deployment](DEPLOYMENT.md) · [Architecture](ARCHITECTURE.md)
 
-## One shared account, regardless of login method
+## OIDC identities become logical tenants
 
-A deployment has one configured `DSH_SERVER_ACCOUNT`, one Gateway device namespace and no per-user ownership partition. Password login is available by default; Logto OIDC is optional; password login can be disabled after OIDC has been validated.
+A verified OIDC `issuer + sub` identifies a stable tenant within the shared Gateway. Verified email is admission/display metadata, not an ownership key. An email change does not move devices, and two subjects with the same email do not share a namespace. Callers cannot select a tenant by submitting its ID.
 
-**An email allowlist is admission control, not multi-tenancy.** Multiple accepted Logto identities do not receive isolated hosts, devices, sessions or quotas. A requirement for up to ten different, mutually isolated accounts is not supported by one current instance. Do not add emails and assume isolation. Use separately operated deployments or implement and independently test an actual tenancy design before serving unrelated users.
+Sessions carry signed v2 principals and are checked against the live tenant registry. Devices and saved credential digests bind to the authenticated tenant; per-tenant lists, peer lookups, mutations, Host authorization, refresh/revoke, WebSocket links and TURN caches use that scope. Logical isolation does not provide separate execution, storage, availability or quota reservations. See [multi-tenancy](MULTITENANCY.md).
 
-## Password login
+## Logto OIDC flow
 
-`POST /api/v1/auth/login` checks the one configured account/password and issues the server's signed session credential. The implementation includes rate limits, account lockout and timing-equalized comparisons. These are controls, not a security certification or justification for a weak/reused password.
+1. A client discovers the `logto` provider, then starts a short-lived QR/poll flow or opens direct browser entry.
+2. The server redirects to Logto with S256 PKCE, signed state and a nonce. A secure browser-state cookie binds the callback to its initiating browser.
+3. Code exchange uses confidential-client Basic authentication. ID-token signature/claims are verified against the configured tenant JWKS.
+4. Verified email and the configured admission policy are checked; the verified issuer/subject resolves or admits the tenant within capacity.
+5. An ordinary admitted flow receives this server's tenant-bound session. The verifier/flow is consumed once; QR collection is single-use and expires.
 
-Real passwords belong in Cloudflare Secrets. The current startup floor is 8 characters, but operators should use a long, random, independent secret. The startup check also requires a session-signing secret of at least 16 characters. Exact account spelling matters for password authentication; a normalized email is simplest when sharing identity with OIDC.
+The official `@logto/js` SDK handles discovery, authorization URL and code-exchange details; `jose` validates signatures/claims. Current permitted ID-token algorithms are ES384, ES256 and RS256 with issuer, audience/authorized-party, time, subject and nonce checks. SDK decoding alone is not authorization. Discovery is restricted to the expected HTTPS Logto origin/layout. See [setup](DEPLOYMENT.md#4-logto-oidc-and-admission).
 
-## Optional Logto OIDC
+### Admission policy and capacity
 
-Current supported integration uses the authorization-code flow:
+- `email_verified` must be boolean `true`; missing, false and string values are rejected.
+- Default or unrecognized `DSH_SERVER_OIDC_ADMISSION` uses the verified-email allowlist. It defaults to normalized `DSH_SERVER_ACCOUNT`; `OAUTH_ALLOWED_ACCOUNTS` replaces that list. Accepted distinct issuer/subject identities still receive distinct tenants.
+- Explicit `DSH_SERVER_OIDC_ADMISSION=application` trusts a successfully verified login to the configured Logto app with verified email. **The server does not validate roles claims.** Configure Logto application access policy before enabling this mode. Merely assigning a role without enforcing app access is not a server-side role authorization rule.
+- `DSH_SERVER_MAX_TENANTS` defaults to ten tenant records. Disabled users still count; one original-owner slot stays reserved until owner binding. This is an admission cap, not guaranteed active capacity or per-user billing.
+- The app requests `openid profile email` by default, without automatically adding `offline_access`. Extra scopes/resources are operator choices.
+- Current HTTP provider routing is specifically Logto; historical generic-provider examples are not a supported setup guide.
 
-1. A client discovers the `logto` provider.
-2. It starts a short-lived QR flow and polls, or opens the direct Logto start URL.
-3. The server redirects a browser to Logto with S256 PKCE, signed state and a nonce. A secure browser-state cookie binds the response to the initiating browser.
-4. The server exchanges the authorization code using confidential-client Basic authentication and verifies the ID token against the configured tenant JWKS.
-5. Only an explicitly verified, allowlisted email can receive this server's own session credential.
-6. The verifier/flow is consumed once; QR token collection is also single-use and expiration is enforced.
+### Original owner and identity-only enrollment
 
-The official `@logto/js` SDK handles discovery, authorization URL and code-exchange protocol details. `jose` performs signature and claim validation; SDK decoding alone is not authorization. The current allowlist of ID-token signature algorithms is ES384, ES256 and RS256, with issuer, audience/authorized-party, time, subject and nonce checks.
+Upgraded device/token state is retained in a reserved `legacy-owner` tenant. The owner is **not** assigned by first login or matching email. Before ordinary admission of that identity, configure exact `DSH_SERVER_LEGACY_OWNER_ISSUER` and `DSH_SERVER_LEGACY_OWNER_SUBJECT`.
 
-The tenant must use the expected HTTPS Logto endpoint layout. Discovery cannot redirect client authentication to an unrelated token origin. Setup and the exact callback are documented in [deployment](DEPLOYMENT.md#4-optional-logto-oidc).
-
-### Identity policy
-
-- Default allowed email is `DSH_SERVER_ACCOUNT`, compared as a normalized email for OIDC.
-- `email_verified` must be the boolean `true`; missing, false or string values are rejected.
-- The provider authenticating a user does not automatically authorize that user for this deployment.
-- `OAUTH_ALLOWED_ACCOUNTS` can replace the accepted-email list, but **does not add per-account isolation**. For the intended single-owner deployment, leave it unset or keep it to that owner.
-- The app asks for `openid profile email` by default and does not add `offline_access` automatically. Extra scopes/resources require an explicit operator choice.
-- Generic provider configuration left in historical code/notes is not a supported public setup guide. Current HTTP provider routing is specifically Logto.
+If the subject is unknown, use the supervised [identity-only enrollment](MULTITENANCY.md#identity-only-enrollment) gate: a runtime Secret capability plus `DSH_SERVER_IDENTITY_ENROLLMENT_ONLY=1` permits a nonce/PKCE/cookie-bound identity probe. It returns signed evidence but creates no tenant, session or device access. Evidence uses an **independent operator-only** `DSH_SERVER_IDENTITY_EVIDENCE_KEY`, not the URL probe capability; missing/equal keys fail closed. Ordinary callbacks are denied during the gate; saved device credentials remain valid. Verify evidence HMAC with that independent key, pin the owner, remove temporary enrollment Secrets/gate, and only then admit ordinary users. Do not publish either key, identity evidence or enrollment URL.
 
 ### Browser and native handoff
 
-QR landing and direct entry are related but distinct delivery paths. The QR browser confirms authorization while the originating client collects a token by polling. Direct native clients may use the supported `dshremote://oauth` callback. Return targets are restricted; arbitrary external redirects are not supported.
+QR landing confirms browser authorization while the originating client collects the result by polling. Direct native clients may use the supported `dshremote://oauth` return target. Arbitrary external return URLs are not supported.
 
-The existing direct handoff may place a signed session bearer in a same-origin/native callback query. Treat that URL as sensitive. OAuth responses use `no-store` and `no-referrer`; also enable platform query-log redaction and avoid sharing full callback/QR URLs. This client contract is not a recommendation to put tokens in arbitrary URLs.
+The existing direct handoff may place a signed session bearer in a restricted same-origin/native query. Treat it as sensitive: OAuth responses are `no-store`/`no-referrer`, platform query redaction should be enabled, and full callback/QR URLs must not be shared. Query redaction does not hide QR IDs in paths or private identity evidence.
 
-The default same-origin `/app` target does not create a web application: this repository has no bundled Remote workbench and unrelated routes return 418. Use a supported client flow rather than assuming browser sign-in supplies a web UI.
+The default same-origin `/app` target is not a web application; this repository bundles no Remote workbench and unrelated routes return 418. Use a supported client flow.
 
-## OIDC-only mode
+## OIDC-only and legacy password fallback
 
-Set `DSH_SERVER_PASSWORD_LOGIN=disabled` in the ignored deployment config and redeploy with an explicit `--config`. Password login then returns `403 / PASSWORD_LOGIN_DISABLED` instead of validating the supplied password. `off` and `false` are also recognized, but use the documented `disabled` value consistently.
+For shared production use, set `DSH_SERVER_PASSWORD_LOGIN=disabled` in the ignored configuration and deploy with explicit `--config`. Password requests return `403 / PASSWORD_LOGIN_DISABLED`; `off`/`false` are recognized synonyms, but prefer `disabled` consistently. There is **no password-based multi-user signup**.
 
-Keep `DSH_SERVER_PASSWORD` and `SESSION_SECRET` configured: current startup checks still require both. This switch changes **new login admission only**. It does not invalidate an already issued session, refresh token, device access token or an existing registered device. Verify a real owner sign-in before closing your fallback path.
+If deliberately enabled, `POST /api/v1/auth/login` checks only the configured account/password for the reserved original-owner partition. It does not create arbitrary users or authenticate other tenants. Rate limits, lockout and timing-equalized comparison are controls, not a justification for weak/reused secrets. Keep real passwords in Workers Secrets, using a long random independent value.
+
+Current startup checks still require `DSH_SERVER_PASSWORD` (at least 8 characters) and `SESSION_SECRET` (at least 16), even with password login off; use much stronger independent secrets than these floors. Switching admission mode does not itself revoke old credentials. Old tenantless account sessions are rejected by the tenant-aware release and require re-login, while preserved legacy device credentials can continue in their partition. Plan a control-socket reconnect window during migration.
 
 ## Sessions and revocation
 
-Authentication creates more than one credential class; they must not be confused:
-
-| Credential | Current purpose / lifetime | Revocation boundary |
+| Credential | Purpose / current lifetime | Revocation boundary |
 | --- | --- | --- |
-| Signed server session | Account-level login and device registration; currently 8 hours | Expiry or session-signing-key rotation; clearing a browser cookie alone does not revoke copies of the bearer |
-| Device access token | Device API and gateway authentication; currently 1 hour | Device/token revocation and expiry |
-| Device refresh token | Renew device credentials; currently 30 days | Device/token revocation, expiry and refresh-reuse handling |
-| Issued TURN credential | Provider-side allocation; operator-configured TTL | Provider-side expiry/revocation; deleting the local cache is not provider revocation |
+| Signed v2 server session | Tenant account login/registration; 8 hours, with live tenant validation | Expiry, signing-key rotation and applicable tenant-registry state; deleting one browser cookie is not bearer revocation |
+| Device access token | Tenant-scoped device API/gateway authentication; 1 hour | Device/token revocation and expiry |
+| Device refresh token | Renew its tenant/device credentials; 30 days | Revocation, expiry and refresh-reuse detection |
+| Issued TURN credential | Provider allocation, configured TTL | Provider expiry/revocation; local cache deletion cannot retract a provider capability |
 
-`POST /api/v1/auth/logout` clears the browser session cookie; it is not global logout. Changing the password, account label, email allowlist, IdP session or OIDC-only flag does not revoke all credentials previously issued by this server. A leaked session can remain usable until its own boundary is addressed.
+Refresh replay retains a consumed-token marker and revokes only the matching device in that tenant. Async issuance checks credential generation so an old refresh cannot issue a successor after re-registration. This is separate from the lifetime of credentials already delivered to a client.
 
-For an incident, identify the affected credential class. Rotate the relevant secret, revoke affected registered devices, and verify the resulting behavior. Session-key rotation invalidates signed account sessions but is not a substitute for revoking device credentials or already issued TURN credentials. Do not promise instantaneous retraction of responses already delivered to a client.
+`POST /api/v1/auth/logout` clears the browser cookie; it is not global logout. Password/account-label/allowlist/IdP-session changes or the OIDC-only switch are not substitutes for tenant/device revocation or signing-key rotation. Assess the affected credential class and verify the intended revocation path. A session-key rotation does not revoke device or provider TURN credentials.
 
-Single-account trust is also relevant to `register-owned-role`: an already authenticated device can authorize registration of a Host in the same shared deployment. This is not a cross-user authorization model.
+`register-owned-role` allows an authenticated device to authorize a Host **within its own tenant**; it must not cross tenant boundaries. Retained legacy migration tables do not make a pre-tenant-code rollback safe—see the [rollback gate](MULTITENANCY.md#deployment-and-rollback-gate).
 
 ## Validation levels
 
-Keep these claims separate:
+Keep provider discovery/redirect checks, `prompt=none` callback acceptance, synthetic signed-provider workerd tests, real user client login, two-user cross-tenant rejection and forced TURN/network acceptance as separate evidence levels. A synthetic test is not a third-party audit or proof of every client/network.
 
-- Provider discovery and authorization redirect: configuration/entry-point checks.
-- A non-interactive `prompt=none` response such as `login_required`: app/callback acceptance without authenticating a person.
-- A synthetic signed-provider workerd test: local protocol and runtime regression coverage.
-- A real owner completing login in a supported client: integration acceptance.
-- Forced TURN allocation/data flow and sustained device connectivity: separate network acceptance.
-
-Never enter someone else's password or one-time code as a testing shortcut. Use a disposable staging device/account you control, avoid production state mutation, and follow [testing guidance](TESTING.md).
+Never enter another person's password or one-time code. Use disposable staging identities/devices and follow [testing](TESTING.md).

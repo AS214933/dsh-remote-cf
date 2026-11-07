@@ -1,7 +1,7 @@
 # Publication and privacy checklist
 
-This repository is a single-account Workers port. Public source does not make the
-hosted deployment a public sign-up service. See [architecture](ARCHITECTURE.md).
+This repository is an independently maintained Workers port with logical OIDC tenant isolation. Public source does not make the
+hosted deployment an unrestricted sign-up service. See [architecture](ARCHITECTURE.md) and [multi-tenancy](MULTITENANCY.md).
 
 ## Before publishing a ref
 

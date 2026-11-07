@@ -1,96 +1,93 @@
 # Architecture and limits
 
-[README](../README.md) · [Deployment](DEPLOYMENT.md) · [Authentication](AUTHENTICATION.md)
+[README](../README.md) · [Multi-tenancy](MULTITENANCY.md) · [Deployment](DEPLOYMENT.md) · [Authentication](AUTHENTICATION.md)
 
-## Single-account boundary
+## Logical tenant boundary
 
-**This is a single-account, shared-device deployment. It is not multi-tenant hosting.**
+Verified OIDC `issuer + sub` maps to a stable tenant. Email must be verified for admission but is display/admission metadata, **not the tenant key**: changing email does not move a device pool, and different subjects sharing an email do not share devices.
 
-One Worker routes to a singleton `Gateway` Durable Object. Its device/token tables and peer/link maps represent one deployment owner. There is no user table, per-user device ownership check, tenant-specific Gateway selection or per-user quota partition.
+The current release deliberately retains **one singleton `Gateway` Durable Object** so existing opaque device credentials and first-frame WebSocket authentication remain compatible with clients. Isolation is enforced in authenticated application scope, not by separate processes, physical databases or Cloudflare quota allocations. SQL device keys include `(tenant_id, device_id)`; credential digests resolve their own tenant. A caller-supplied tenant ID in a header/query/body cannot select another partition.
 
-Password and optional Logto OIDC are alternate admission methods into that same namespace. Adding several emails to `OAUTH_ALLOWED_ACCOUNTS` does not isolate their devices. The implementation is therefore **not suitable as-is for up to ten separate accounts requiring mutual isolation**, or for any larger unrelated group.
+Tenant scope applies to sessions, registry checks, device lists/mutations, peer key lookups, owned-Host registration, refresh/revoke, WS peers/links and snapshots, Relay/signaling targets and TURN cache ownership. Default/unrecognized OIDC admission uses the verified-email allowlist; explicit `application` admission trusts configured Logto application access policy and **does not validate a roles claim**. Tenant-record capacity defaults to ten, including disabled users, with an owner slot reserved until binding.
 
-Independent deployments can provide separate stores/secrets at an operational level, but are not a multi-tenant feature of one instance. An actual multi-user design would require explicit tenant identity, storage/routing partitioning, ownership authorization, lifecycle/quota isolation and adversarial cross-tenant tests. This guide does not implement or certify that design.
+See [multi-tenancy](MULTITENANCY.md) for exact identity/admission behavior, owner pinning, identity-only enrollment and the rollback gate. Per-user Worker/DO deployments remain an alternative for stronger resource separation; they are not the topology used by this release.
 
 ## Request and state layout
 
 ```text
 Host / client
-  ├── HTTPS /api/* ── Worker ── Gateway RPC ── SQLite
-  └── WSS /ws/v1/connect ────── Gateway
-                                  ├── hibernating WebSockets
-                                  ├── peers and negotiating links
+  ├── HTTPS /api/* ── Worker ── authenticated principal / Gateway RPC
+  └── WSS /ws/v1/connect ────── singleton Gateway
+                                  ├── live tenant registry
+                                  ├── SQLite: tenant-scoped devices/tokens/flows
+                                  ├── tenant-scoped hibernating peers and links
                                   ├── signaling / encrypted Relay forwarding
-                                  └── alarms and lifecycle deadlines
+                                  └── shared alarms, execution and platform quotas
 ```
 
-The Worker handles HTTP routing, session credentials, Origin/CORS rules and maps Gateway result envelopes into HTTP responses. Gateway RPC method names are chosen by server code, not by a public arbitrary method dispatcher.
+The Worker handles HTTP routing, signed principals, Origin/CORS rules and maps Gateway result envelopes into HTTP responses. Gateway RPC method names are chosen by server code, not by a public arbitrary method dispatcher.
 
-Durable Object SQLite stores registered device metadata, token digests, lockout state and short-lived OAuth flow state. Durable data and hibernating socket attachments survive differently: peer/link lifecycle snapshots must be restored before the first wake event, while the TURN credential cache intentionally remains memory-only.
+SQLite stores the tenant registry, device metadata, credential digests/replay markers, lockout state and short-lived OAuth flow state. Durable data and hibernating socket attachments survive differently: peer/link snapshots restore their tenant and lifecycle authority before the first wake event; the tenant-scoped TURN credential cache intentionally remains memory-only.
 
-The gateway saves negotiating stages, socket-generation identity and Relay replay counters so hibernation does not turn an existing link into an unknown connection. Replacement/close/error paths verify current-socket ownership so a delayed event from an older socket cannot remove its successor. Alarms schedule heartbeat and handshake/hello deadlines; this is not a promise that every deployment or network interruption is invisible to clients.
+The gateway saves negotiating stages, socket-generation identity and Relay replay counters so hibernation does not turn a link into an unknown connection. Replacement/close/error paths verify current-socket ownership so delayed events cannot remove successors. Alarms schedule heartbeat and handshake/hello deadlines. These protections do not guarantee invisible deployment/network interruption or reserved processing time for each tenant.
+
+## Migration and identity authority
+
+Legacy devices and tokens migrate transactionally into a reserved owner partition; private original tables remain as migration backup. Old tenantless account sessions require re-login, and pre-tenant authenticated sockets must reconnect. The original owner is never inferred from matching email or whoever signs in first: pin the exact issuer/subject, using supervised identity-only enrollment when necessary.
+
+**Do not roll back to a pre-tenant binary after onboarding.** Such code ignores tenant ownership and can expose or mutate multiple partitions. Retained backup tables do not make an ordinary old-version rollback safe. Read the [migration and rollout procedure](MULTITENANCY.md#original-owner-migration) before upgrading an existing instance.
 
 ## Transport model
 
 | Transport | Server role |
 | --- | --- |
-| LAN / P2P WebRTC | Authenticate peers, provide descriptors and forward negotiation signaling; the data path can be direct |
-| TURN-assisted WebRTC | Issue optional Cloudflare Realtime TURN credentials and forward signaling; Cloudflare carries the TURN data path |
-| Encrypted server Relay | Forward opaque encrypted frames between the two ends of an authorized link |
+| LAN / P2P WebRTC | Authenticate same-tenant peers, provide descriptors and forward negotiation; the data path can be direct |
+| TURN-assisted WebRTC | Authorize tenant-scoped credential issuance and signaling; Cloudflare carries the TURN data path |
+| Encrypted server Relay | Forward opaque encrypted frames only between the ends of an authorized same-tenant link |
 
-The normal client/Host tunnel uses Noise end-to-end encryption. The service is designed to forward session ciphertext rather than interpret prompts or tool output. It still receives authentication material, public identity keys, device metadata, connection timing and routing identifiers. Encryption does not eliminate the operator's responsibility for logs, credentials, updates or access control.
+The normal client/Host tunnel uses Noise end-to-end encryption. The service forwards session ciphertext rather than interpreting prompts/tool output, but still receives authentication material, public keys, device metadata, timing and routing identifiers. Encryption does not eliminate operator responsibility for logs, credentials, updates or authorization.
 
-Workers do not run a TURN server. A separate TURN implementation is not a drop-in configured backend of this repository's Cloudflare credential issuer. Obtaining an ICE list is not evidence that a TURN allocation or data channel works across a restrictive network.
-
-See [connection latency](CONNECTION-LATENCY.md) for fused Gateway lookups and nonblocking credential prefetch. Neither cache reuse nor server Relay changes client cryptographic handshakes or makes clients mutually untrusted tenants.
+Workers do not run a TURN server. Another TURN implementation is not a drop-in backend for this Cloudflare credential issuer. Obtaining ICE configuration does not prove a TURN allocation/data channel across a restrictive network. See [connection latency](CONNECTION-LATENCY.md) for fused lookups and nonblocking credential prefetch; neither caching nor Relay changes client cryptographic handshakes.
 
 ## Default HTTP behavior
 
-`/healthz`, supported API routes and `/ws/v1/connect` have explicit handlers. The root and unrelated paths default to **418**. `DSH_SERVER_ROOT_PAGE=assets` can opt into the bundled root asset, which is only a placeholder—not a Remote web workbench or SPA.
+`/healthz`, supported API routes and `/ws/v1/connect` have explicit handlers. The root and unrelated paths default to **418**. `DSH_SERVER_ROOT_PAGE=assets` opts into a placeholder root asset, not a Remote workbench or SPA.
 
-418 responses and indexing headers are operational choices, not security-through-invisibility guarantees. The API remains discoverable, CORS is not authentication, and an Origin allowlist is not an account/tenant partition.
+418/indexing headers are operational choices, not invisibility guarantees. The API is discoverable, CORS is not authentication, and an Origin allowlist is not a tenant selector.
 
 ## Limits and security boundaries
 
-Current implementation limits include:
-
 | Resource | Current bound |
 | --- | --- |
-| Registered devices / token rows | 64 / 1024 per shared deployment |
-| Gateway peers / links | 256 / 256 |
+| Tenant records | Default ten; disabled users count, owner slot reserved until binding |
+| Device rows / active credential rows | 64 / 1,024 per tenant |
+| Used-refresh replay markers | 50,000 per tenant, expiring with original refresh TTL |
+| Online peers / active links | 32 / 16 per tenant; global 256 peer/link ceilings |
 | Control / Relay frame ceiling | 64 KiB / 1 MiB |
 | Frame budget | 512 frames and 16 MiB per one-second window per connection |
 | ICE candidates | 256 per connection |
-| TURN cache | At most 64 retained entries and 64 total in-flight mints |
+| TURN cache | Bounded shared memory cache; credential ownership includes authenticated tenant/device |
 
-These are implementation bounds, not a throughput guarantee, spending cap or Cloudflare quota override. Refer to source and [operations](OPERATIONS.md) when changing limits; platform plans, billing and native client behavior are separate constraints.
+These are protective implementation bounds, **not guaranteed per-user capacity, a billing system, a spending cap or a Cloudflare quota override**. Global pre-auth sockets, the singleton event loop, SQL storage and platform quotas remain shared. One tenant's heavy usage can affect others despite access-control isolation. See [operations](OPERATIONS.md) for the current one-Gateway cost model and the alternative physical-per-user model.
 
 Additional boundaries:
 
-- There is no full-upstream-parity or independent security-certification claim. Client and upstream revisions must be tested explicitly.
-- The gateway's short-window output estimate is not a true native `bufferedAmount` backpressure measurement. Bursts and slow receivers need dedicated testing.
-- Routing payload validation is not proof that every forwarded payload/UTF-8/schema case matches upstream. Capability advertising and older-client compatibility also need explicit regression coverage.
-- Deployments can interrupt active connections; client reconnection and reauthentication behavior must be included in release acceptance.
+- No full-upstream-parity or independent security-certification claim; test client/upstream revisions explicitly.
+- Short-window output estimates are not native `bufferedAmount` backpressure measurement. Bursts and slow receivers need dedicated testing.
+- Payload/schema validation is not proof of complete upstream parity. Capability advertising and older-client compatibility need explicit regression coverage.
+- Deployments can interrupt connections; include reconnect, tenant-aware reauthentication and migration in acceptance.
 - Changing password/OIDC settings is not global credential revocation. See [sessions and revocation](AUTHENTICATION.md#sessions-and-revocation).
-- Query-log redaction does not redact QR IDs in paths or custom identifier logs. Logs remain sensitive operational data.
-- A pass from a legacy live diagnostic is not a release gate; see [testing](TESTING.md).
+- Query-log redaction does not redact QR IDs in paths, identity evidence or custom identifier logs. Operational logs remain sensitive.
+- Legacy live-diagnostic labels are not release gates; use the isolated tests and multi-user acceptance in [testing](TESTING.md).
 
 ## Source origin and licensing
 
-The canonical source project is [liguobao/ds-harness-remote](https://github.com/liguobao/ds-harness-remote). The [AS214933 fork](https://github.com/AS214933/ds-harness-remote) has also been used as a protocol reference. This repository declares its own MIT license in [LICENSE](../LICENSE) and is not an official upstream service.
+The canonical project is [liguobao/ds-harness-remote](https://github.com/liguobao/ds-harness-remote); the [AS214933 fork](https://github.com/AS214933/ds-harness-remote) is also a protocol reference. This repository declares MIT in [LICENSE](../LICENSE) and is not an official upstream service.
 
-A repository-level license declaration does not erase other authors' notices. For any substantially copied or adapted upstream material, identify the exact source revision and preserve the applicable original copyright/license notices alongside this port's notice. Do not infer either clean-room implementation or infringement merely from protocol similarity; the precise derivation must be established from the actual source history.
+A repository license does not erase other authors' notices. For substantially copied/adapted material, identify the exact revision and preserve applicable original notices alongside this port's notice. Do not infer either clean-room implementation or infringement solely from protocol similarity; precise derivation depends on source history.
 
-Likewise, preserve applicable dependency notices when distributing bundled Worker code. Development-tool or optional native-binary licenses must be reviewed if those tools/binaries are redistributed; their presence in a development lockfile does not by itself determine the license of this server's source. This guide is not a legal opinion or a claim that all attribution questions have been resolved.
+Preserve dependency notices when distributing bundled Worker code. Review development-tool/native-binary licenses if redistributing those artifacts; their presence in the lockfile does not itself determine the server source license. See [third-party notices](../THIRD_PARTY_NOTICES.md). This guide is not a legal opinion.
 
 ## Historical design notes
 
-The following files are retained as explicitly historical summaries, not current deployment or security guarantees:
-
-- [Parity investigation](PARITY.md)
-- [OAuth feasibility](OAUTH-FEASIBILITY.md)
-- [Browser redirect investigation](OAUTH-REDIRECT-FEASIBILITY.md)
-- [Logto SDK investigation](LOGTO-SDK-RESEARCH.md)
-- [Hibernation/connection investigation](PENDING-MOBILE-CONNECT.md)
-
-Use the current architecture, authentication, deployment and testing guides for supported behavior.
+[Parity](PARITY.md), [OAuth feasibility](OAUTH-FEASIBILITY.md), [redirect investigation](OAUTH-REDIRECT-FEASIBILITY.md), [SDK investigation](LOGTO-SDK-RESEARCH.md) and [hibernation investigation](PENDING-MOBILE-CONNECT.md) are historical summaries, not current deployment/security guarantees. Use the current architecture, multi-tenancy, authentication, deployment and testing guides.
