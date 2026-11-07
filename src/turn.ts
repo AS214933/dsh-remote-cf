@@ -66,5 +66,55 @@ export async function turnIceServers(env: Env, deviceId: string): Promise<IceSer
   }
 }
 
+/**
+ * Best-effort, per-device credential reuse in one Gateway instance. Nothing is
+ * persisted: hibernation or deployment simply makes the next lookup cold.
+ * Credentials are not connection-bound by the provider; every caller must still
+ * authorize its current link before AND after awaiting this cache.
+ */
+export class TurnCredentialCache {
+  private readonly entries = new Map<string, { result: Promise<IceServer[] | null>; validUntil: number; settled: boolean }>()
+  private activeFetches = 0
+
+  constructor(private readonly env: Env) {}
+
+  get(deviceId: string): Promise<IceServer[] | null> {
+    const cfg = resolveTurn(this.env)
+    if (cfg === null) return Promise.resolve(null)
+    const now = Date.now()
+    for (const [id, entry] of this.entries) {
+      if (entry.settled && entry.validUntil <= now) this.entries.delete(id)
+    }
+    const cached = this.entries.get(deviceId)
+    if (cached !== undefined) {
+      console.info('turn credential lookup', { source: cached.settled ? 'cache' : 'inflight' })
+      return cached.result
+    }
+    // Bound both retained entries and *all* flights, including ones invalidated
+    // during revocation. Invalidation cannot create an unbounded off-map pile.
+    if (this.entries.size >= 64 || this.activeFetches >= 64) return Promise.resolve(null)
+    // Anchor before the fetch, retain a 60 s handshake margin, cap reuse at five
+    // minutes. At minimum TTL a fresh result still works, but is not reused.
+    const validUntil = now + Math.min(300_000, Math.max(0, cfg.ttlSeconds - 60) * 1000)
+    const entry = { result: Promise.resolve<IceServer[] | null>(null), validUntil, settled: false }
+    this.activeFetches++
+    entry.result = turnIceServers(this.env, deviceId).then(servers => {
+      entry.settled = true
+      this.activeFetches--
+      console.info('turn credential mint', { durationMs: Date.now() - now, success: servers !== null })
+      if (this.entries.get(deviceId) === entry && (servers === null || Date.now() >= validUntil)) {
+        this.entries.delete(deviceId)
+      }
+      // No rejected promise or negative result is retained. A stale invalidated
+      // flight never writes an entry back, nor removes its newer replacement.
+      return Date.now() < now + cfg.ttlSeconds * 1000 ? servers : null
+    })
+    this.entries.set(deviceId, entry)
+    return entry.result
+  }
+
+  forget(deviceId: string): void { this.entries.delete(deviceId) }
+}
+
 /** STUN-only list, used when TURN is unavailable but STUN is worth advertising. */
 export const STUN_ONLY: IceServer[] = [{ urls: 'stun:stun.cloudflare.com:3478' }]

@@ -9,18 +9,31 @@ import { execFileSync } from 'node:child_process'
 
 // Optional historical control: GATEWAY_SOURCE_REF=5eb8da7 must fail after eviction.
 const baseline = process.env.GATEWAY_SOURCE_REF
-const plugins = baseline ? [{ name: 'historical-gateway', setup(build) {
-  build.onLoad({ filter: /[/\\]src[/\\]gateway\.ts$/ }, () => ({
-    contents: execFileSync('git', ['show', `${baseline}:src/gateway.ts`], { encoding: 'utf8' }),
-    loader: 'ts', resolveDir: `${process.cwd()}/src`,
-  }))
+// Performance control loads the complete pre-optimization setup path.
+const setupBaseline = process.env.SETUP_SOURCE_REF
+const plugins = baseline || setupBaseline ? [{ name: 'historical-gateway', setup(build) {
+  build.onLoad({ filter: /[/\\]src[/\\](gateway|worker|turn)\.ts$/ }, args => {
+    const name = args.path.replaceAll('\\', '/').split('/').at(-1)
+    if (!setupBaseline && name !== 'gateway.ts') return
+    return { contents: execFileSync('git', ['show', `${setupBaseline ?? baseline}:src/${name}`], { encoding: 'utf8' }),
+      loader: 'ts', resolveDir: `${process.cwd()}/src` }
+  })
 } }] : []
+let issuerCalls = 0
+const issuerDelayMs = 150
 const built = await build({ entryPoints: ['src/worker.ts'], bundle: true, write: false, plugins,
   format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], conditions: ['workerd', 'worker', 'browser'] })
 const runtime = new Miniflare(convertV4MiniflareOptions({ name: 'lifecycle-test', modules: true,
   script: built.outputFiles[0].text, compatibilityDate: '2026-04-07',
   compatibilityFlags: ['nodejs_compat'], durableObjects: { GATEWAY: { className: 'Gateway', useSQLite: true } },
-  bindings: { DSH_SERVER_ACCOUNT: 'owner@example.com', DSH_SERVER_PASSWORD: 'local-test-password-only',
+  outboundService: async request => {
+    assert.equal(new URL(request.url).hostname, 'rtc.live.cloudflare.com', 'no real network allowed')
+    const call = ++issuerCalls
+    await new Promise(resolve => setTimeout(resolve, issuerDelayMs))
+    return new Response(JSON.stringify({ iceServers: [{ urls: 'turn:synthetic.example', username: `test-${call}`, credential: `test-only-${call}` }] }),
+      { headers: { 'Content-Type': 'application/json' } })
+  },
+  bindings: { TURN_KEY_ID: 'synthetic-test-key', TURN_KEY_API_TOKEN: 'synthetic-test-token', DSH_SERVER_ACCOUNT: 'owner@example.com', DSH_SERVER_PASSWORD: 'local-test-password-only',
     DSH_SERVER_PUBLIC_URL: 'https://relay.example', SESSION_SECRET: 'test-session-secret-long-enough' } }))
 const sockets = []
 const evict = () => runtime.unsafeEvictDurableObject('lifecycle-test', 'Gateway', { name: 'gateway', webSockets: 'hibernate' })
@@ -67,13 +80,46 @@ try {
     assert.equal(upgraded.status, 101)
     const connection = wire(upgraded.webSocket)
     sockets.push(connection.socket)
-    connection.send('hello', { role, deviceId, accessToken: credentials.accessToken, protocols: [1], capabilities: ['transport.relay'] })
+    connection.send('hello', { role, deviceId, accessToken: credentials.accessToken, protocols: [1], capabilities: ['transport.relay', 'transport.p2p', 'transport.turn'] })
     await connection.next('hello.ack')
-    return { ...connection, deviceId }
+    return { ...connection, deviceId, accessToken: credentials.accessToken }
   }
   const host = await connect('host'), client = await connect('client')
+  client.send('connect.request', { hostDeviceId: host.deviceId, preferredTransports: ['p2p', 'turn', 'relay'] })
+  const rtcId = (await host.next('connect.incoming')).payload.connectionId
+  host.send('connect.accepted', { connectionId: rtcId })
+  await client.next('connect.accepted')
+  const credentials = async peer => {
+    const response = await runtime.dispatchFetch(`https://relay.example/api/v1/turn/credentials?connection_id=${rtcId}`,
+      { headers: { Authorization: `Bearer ${peer.accessToken}` } })
+    assert.equal(response.status, 200)
+    return (await response.json()).iceServers
+  }
+  // Model the real offer/answer order: client credentials first, then Host.
+  const coldStarted = performance.now()
+  const clientIce = await credentials(client)
+  const hostStarted = performance.now()
+  const hostIce = await credentials(host)
+  const coldMs = Math.round(performance.now() - coldStarted)
+  const hostMs = Math.round(performance.now() - hostStarted)
+  assert.equal(issuerCalls, 2, 'accepted-stage prefetch and request must join one flight per device')
+  assert.notEqual(clientIce[0].credential, hostIce[0].credential)
+  const warmStarted = performance.now()
+  await credentials(client); await credentials(host)
+  const warmMs = Math.round(performance.now() - warmStarted)
+  assert.equal(issuerCalls, setupBaseline ? 4 : 2, 'optimized warm calls must not mint again')
+  console.log(`PASS: ${setupBaseline ? 'baseline' : 'optimized'} serial client/Host, ${issuerDelayMs}ms issuer: cold=${coldMs}ms, host=${hostMs}ms, warm=${warmMs}ms`)
+  await evict()
+  await credentials(client)
+  assert.equal(issuerCalls, setupBaseline ? 5 : 3, 'hibernation discards cache but preserves link authorization')
+  console.log('PASS: real hibernation discards only credential cache; fresh authorization and mint still work')
+  const peer = await request(`/api/v1/devices/${host.deviceId}`, 'GET', undefined, client.accessToken)
+  assert.equal(peer.identityKey.length, 43, 'fused peer auth keeps the pinned-key descriptor')
+  assert.equal(peer.online, true)
   await evict()
   client.send('connect.request', { hostDeviceId: host.deviceId, preferredTransports: ['relay'] })
+  assert.equal((await host.next('error')).payload.code, 'CONNECTION_REPLACED')
+  assert.equal((await client.next('error')).payload.code, 'CONNECTION_REPLACED')
   const incoming = await host.next('connect.incoming')
   const connectionId = incoming.payload.connectionId
   console.log('PASS: first event after hibernation routes to the existing host')

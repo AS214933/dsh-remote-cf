@@ -13,7 +13,7 @@ import type { Env } from './env.js'
 import { DEFAULT_LOCKOUT, RATE_LIMITS } from './config.js'
 import { assertConfigured, passwordLoginDisabled, verifyCredentials } from './auth.js'
 import { signSession, sha256Hex, verifySession, toBase64Url } from './crypto.js'
-import { turnIceServers } from './turn.js'
+import type { IceServer } from './turn.js'
 import { isDeviceId, isIdentityKey } from './protocol.js'
 import type { Result } from './result.js'
 import { corsHeaders, parseAllowedOrigins, preflightResponse } from './cors.js'
@@ -34,7 +34,7 @@ interface TokenPair {
 interface AuthenticatedDevice {
   deviceId: string; role: 'host' | 'client'; name: string; platform: string
   identityKey: string; clientVersion: string; harnessVersion: string | null
-  revoked: boolean; lastSeenAt: number
+  revoked: boolean; lastSeenAt: number; online: boolean
 }
 interface DeviceSummary {
   deviceId: string; role: string; name: string; platform: string; clientVersion: string
@@ -420,14 +420,13 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (method === 'GET' && path === '/api/v1/turn/credentials') {
-    const device = await requireDevice(request, env)
+    const token = bearer(request)
+    if (token === null) throw new ApiError('AUTH_REQUIRED', 401)
     const connectionId = url.searchParams.get('connection_id') ?? ''
     if (connectionId === '' || connectionId.length > 128) throw new ApiError('INVALID_MESSAGE', 400)
-    // Only the two ends of a link still being established may obtain credentials.
-    const allowed = await callGateway<boolean>(env, 'authorizeTurn', [device.deviceId, connectionId])
-    if (!allowed) throw new ApiError('CONNECTION_NOT_FOUND', 404)
-    const iceServers = await turnIceServers(env, device.deviceId)
-    return Response.json({ iceServers: iceServers ?? [] })
+    const result = await callGateway<Result<IceServer[]>>(env, 'getIceServers', [token, connectionId])
+    if (!result.ok) throw new ApiError(result.code, result.status)
+    return Response.json({ iceServers: result.value }, { headers: { 'Cache-Control': 'no-store' } })
   }
 
   const renameMatch = /^\/api\/v1\/devices\/([^/]+)\/name$/.exec(path)
@@ -444,14 +443,13 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
   const deviceMatch = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)
   if (method === 'GET' && deviceMatch !== null) {
-    const source = await requireDevice(request, env)
-    const target = await callGateway<DeviceSummary | null>(env, 'getDevice', [deviceMatch[1]!])
-    // A device that does not exist and one that belongs to another account are
-    // reported identically: any difference is an existence oracle. (Single-account
-    // makes the second case impossible today, but the shape must not regress.)
-    if (target === null) throw new ApiError('DEVICE_NOT_FOUND', 404)
-    if (source.role === target.role) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
-    const full = descriptor(target, env)
+    const token = bearer(request)
+    if (token === null) throw new ApiError('AUTH_REQUIRED', 401)
+    // Keep the fresh membership/role check and full pinned-key descriptor, but
+    // perform the mandatory Host/client lookup in one DO hop rather than three.
+    const result = await callGateway<Result<DeviceSummary>>(env, 'getAuthorizedPeer', [token, deviceMatch[1]!])
+    if (!result.ok) throw new ApiError(result.code, result.status)
+    const full = descriptor(result.value, env)
     return Response.json(deviceMatch[2] !== undefined
       ? { deviceId: full.deviceId, online: full.online, lastSeenAt: full.lastSeenAt }
       : full)
@@ -542,10 +540,7 @@ async function requireDevice(request: Request, env: Env): Promise<{
   if (token === null) throw new ApiError('AUTH_REQUIRED', 401)
   const result = await callGateway<Result<AuthenticatedDevice>>(env, 'authenticateDevice', [token])
   if (!result.ok) throw new ApiError(result.code, result.status)
-  const device = result.value
-  const online = await callGateway<DeviceSummary | null>(env, 'getDevice', [device.deviceId])
-    .then(entry => entry?.online ?? false)
-  return { ...device, online }
+  return result.value
 }
 
 function cookieHeader(env: Env, value: string, maxAgeSeconds: number): string {
@@ -741,13 +736,11 @@ async function routeOAuth(request: Request, env: Env, url: URL): Promise<Respons
     return landingPage(request, env, deps, decodeURIComponent(landingMatch[1]!))
   }
 
-  const startMatch = /^\/api\/v1\/auth\/oauth\/([^/]+)\/start$/.exec(url.pathname)
-  if (request.method === 'GET' && startMatch !== null) {
+  if (request.method === 'GET' && url.pathname === '/api/v1/auth/oauth/logto/start') {
     return startRedirect(request, env, deps)
   }
 
-  const callbackMatch = /^\/api\/v1\/auth\/oauth\/([^/]+)\/callback$/.exec(url.pathname)
-  if (request.method === 'GET' && callbackMatch !== null) {
+  if (request.method === 'GET' && url.pathname === '/api/v1/auth/oauth/logto/callback') {
     return handleCallback(request, env, deps)
   }
 

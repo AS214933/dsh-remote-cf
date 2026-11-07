@@ -9,7 +9,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   accountFromClaims, allowedAccounts, callbackUrl, createPkce, logtoConfig, resetLogtoCache,
-  verifyIdToken,
+  verifyIdToken, buildSignInUrl, exchange,
 } from '../src/logto.js'
 import { isAllowedReturnTo, signState, verifyState } from '../src/oauth.js'
 import type { Env } from '../src/env.js'
@@ -17,6 +17,7 @@ import type { Env } from '../src/env.js'
 const SECRET = 'session-secret-long-enough'
 const ENDPOINT = 'https://auth.example.com'
 const CLIENT_ID = 'client-abc'
+const NONCE = 'test-flow-nonce-unique'
 
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return {
@@ -93,6 +94,8 @@ function claims(overrides: Record<string, unknown> = {}): Record<string, unknown
     exp: now + 3600,
     iat: now - 10,
     email: 'Owner@Example.com',
+    email_verified: true,
+    nonce: NONCE,
     ...overrides,
   }
 }
@@ -151,7 +154,7 @@ describe('verifyIdToken', () => {
     try {
       const config = logtoConfig(makeEnv())!
       const token = await makeIdToken(claims())
-      const result = await verifyIdToken(config, token)
+      const result = await verifyIdToken(config, token, NONCE)
       expect(result?.email).toBe('Owner@Example.com')
     } finally { vi.unstubAllGlobals() }
   })
@@ -162,7 +165,7 @@ describe('verifyIdToken', () => {
     try {
       const config = logtoConfig(makeEnv())!
       const token = await makeIdToken(claims(), { tamper: true })
-      expect(await verifyIdToken(config, token)).toBeNull()
+      expect(await verifyIdToken(config, token, NONCE)).toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 
@@ -173,7 +176,7 @@ describe('verifyIdToken', () => {
       const config = logtoConfig(makeEnv())!
       const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: 'none', typ: 'JWT' })))
       const payload = b64url(new TextEncoder().encode(JSON.stringify(claims())))
-      expect(await verifyIdToken(config, `${header}.${payload}.`)).toBeNull()
+      expect(await verifyIdToken(config, `${header}.${payload}.`, NONCE)).toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 
@@ -182,7 +185,7 @@ describe('verifyIdToken', () => {
     try {
       const config = logtoConfig(makeEnv())!
       const token = await makeIdToken(claims({ iss: 'https://evil.example/oidc' }))
-      expect(await verifyIdToken(config, token)).toBeNull()
+      expect(await verifyIdToken(config, token, NONCE)).toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 
@@ -191,7 +194,7 @@ describe('verifyIdToken', () => {
     try {
       const config = logtoConfig(makeEnv())!
       const token = await makeIdToken(claims({ aud: 'someone-elses-client' }))
-      expect(await verifyIdToken(config, token)).toBeNull()
+      expect(await verifyIdToken(config, token, NONCE)).toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 
@@ -199,8 +202,8 @@ describe('verifyIdToken', () => {
     stubProvider()
     try {
       const config = logtoConfig(makeEnv())!
-      const token = await makeIdToken(claims({ aud: ['other', CLIENT_ID] }))
-      expect(await verifyIdToken(config, token)).not.toBeNull()
+      const token = await makeIdToken(claims({ aud: ['other', CLIENT_ID], azp: CLIENT_ID }))
+      expect(await verifyIdToken(config, token, NONCE)).not.toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 
@@ -210,7 +213,7 @@ describe('verifyIdToken', () => {
       const config = logtoConfig(makeEnv())!
       const past = Math.floor(Date.now() / 1000) - 10
       const token = await makeIdToken(claims({ iat: past - 3600, exp: past }))
-      expect(await verifyIdToken(config, token)).toBeNull()
+      expect(await verifyIdToken(config, token, NONCE)).toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 
@@ -219,7 +222,7 @@ describe('verifyIdToken', () => {
     try {
       const config = logtoConfig(makeEnv())!
       const token = await makeIdToken(claims(), { kid: 'unknown-kid' })
-      expect(await verifyIdToken(config, token)).toBeNull()
+      expect(await verifyIdToken(config, token, NONCE)).toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 
@@ -228,29 +231,93 @@ describe('verifyIdToken', () => {
     try {
       const config = logtoConfig(makeEnv())!
       for (const bad of ['', 'a', 'a.b', 'a.b.c.d', 'not.a.token']) {
-        expect(await verifyIdToken(config, bad)).toBeNull()
+        expect(await verifyIdToken(config, bad, NONCE)).toBeNull()
       }
     } finally { vi.unstubAllGlobals() }
   })
 
   it('returns null when the tenant is unreachable', async () => {
+    resetLogtoCache()
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
     try {
       const config = logtoConfig(makeEnv())!
-      expect(await verifyIdToken(config, await makeIdToken(claims()))).toBeNull()
+      expect(await verifyIdToken(config, await makeIdToken(claims()), NONCE)).toBeNull()
     } finally { vi.unstubAllGlobals() }
   })
 })
 
 describe('accountFromClaims', () => {
   it('lower-cases the email', () => {
-    expect(accountFromClaims({ email: 'A@B.com' } as never)).toBe('a@b.com')
+    expect(accountFromClaims({ email: 'A@B.com', email_verified: true } as never)).toBe('a@b.com')
   })
 
   it('is null without an email, so the flow can refuse rather than invent one', () => {
     expect(accountFromClaims({} as never)).toBeNull()
     expect(accountFromClaims({ email: '' } as never)).toBeNull()
     expect(accountFromClaims({ email: 42 } as never)).toBeNull()
+  })
+})
+
+describe('confidential OIDC exchange and flow binding', () => {
+  it('uses SDK PKCE form parameters plus client_secret_basic only at the token endpoint', async () => {
+    stubProvider()
+    const discoveryFetch = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== `${ISSUER}/token`) {
+        expect(new Headers(init?.headers).get('Authorization')).toBeNull()
+        return discoveryFetch(input, init)
+      }
+      expect(new Headers(init?.headers).get('Authorization')).toBe(`Basic ${btoa(`${CLIENT_ID}:client-secret`)}`)
+      const params = new URLSearchParams(String(init?.body))
+      expect(params.get('grant_type')).toBe('authorization_code')
+      expect(params.get('code')).toBe('test-code')
+      expect(params.get('code_verifier')).toBe('test-verifier')
+      expect(params.get('redirect_uri')).toBe('https://relay.example/callback')
+      expect(params.has('client_secret')).toBe(false)
+      return Response.json({ access_token: 'synthetic-access', id_token: 'synthetic-id', expires_in: 300 })
+    }))
+    try {
+      const config = logtoConfig(makeEnv())!
+      const target = new URL((await buildSignInUrl(config, { redirectUri: 'https://relay.example/callback', state: 'signed-state', challenge: 'challenge', nonce: NONCE }))!)
+      expect(target.searchParams.get('nonce')).toBe(NONCE)
+      expect(target.searchParams.get('code_challenge_method')).toBe('S256')
+      expect(target.searchParams.get('scope')?.split(' ')).not.toContain('offline_access')
+      expect(await exchange(config, { code: 'test-code', verifier: 'test-verifier', redirectUri: 'https://relay.example/callback' }))
+        .toEqual({ accessToken: 'synthetic-access', idToken: 'synthetic-id', expiresIn: 300 })
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('rejects missing/wrong nonce, multiple audiences without azp, future iat and empty subject', async () => {
+    stubProvider()
+    try {
+      const config = logtoConfig(makeEnv())!
+      for (const value of [claims({ nonce: undefined }), claims({ nonce: 'wrong-nonce' }), claims({ aud: [CLIENT_ID, 'other'] }),
+        claims({ azp: 'other' }), claims({ iat: Math.floor(Date.now() / 1000) + 121 }), claims({ sub: '' })]) {
+        expect(await verifyIdToken(config, await makeIdToken(value), NONCE)).toBeNull()
+      }
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('accepts real ES384 signatures as emitted by the tenant', async () => {
+    stubProvider()
+    const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-384' }, true, ['sign', 'verify']) as CryptoKeyPair
+    const jwk = await crypto.subtle.exportKey('jwk', pair.publicKey)
+    const discoveryFetch = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => String(input) === JWKS_URI
+      ? Response.json({ keys: [{ ...jwk, kid: 'ec-key', alg: 'ES384', use: 'sig' }] }) : discoveryFetch(input, init)))
+    try {
+      const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: 'ES384', kid: 'ec-key' })))
+      const payload = b64url(new TextEncoder().encode(JSON.stringify(claims())))
+      const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-384' }, pair.privateKey, new TextEncoder().encode(`${header}.${payload}`))
+      expect((await verifyIdToken(logtoConfig(makeEnv())!, `${header}.${payload}.${b64url(signature)}`, NONCE))?.sub).toBe('user-1')
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('never authorizes unverified or malformed email claims', () => {
+    for (const verified of [undefined, false, null, 'true', 1]) {
+      expect(accountFromClaims({ email: 'owner@example.com', email_verified: verified } as never)).toBeNull()
+    }
+    expect(accountFromClaims({ email: 'not-an-email', email_verified: true } as never)).toBeNull()
   })
 })
 

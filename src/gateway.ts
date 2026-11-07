@@ -16,6 +16,7 @@ import { resolveTiming, resolveTurn, type TimingConfig, type TurnConfig } from '
 import { Store, StoreError } from './store.js'
 import { err, fromThrown, ok, type Result } from './result.js'
 import { sha256Hex, randomToken } from './crypto.js'
+import { TurnCredentialCache, type IceServer } from './turn.js'
 import {
   FRAME_BUDGET, MAX_CONTROL_FRAME_BYTES, MAX_ICE_CANDIDATES_PER_CONNECTION, MAX_RELAY_FRAME_BYTES,
   SERVER_SHUTDOWN_CLOSE_CODE, SERVER_SHUTDOWN_CLOSE_REASON, TRANSPORT_NAMES,
@@ -100,6 +101,7 @@ export class Gateway extends DurableObject<Env> {
   private readonly timing: TimingConfig
   private readonly turn: TurnConfig | null
   private readonly store: Store
+  private readonly turnCredentials: TurnCredentialCache
 
   /** deviceId -> socket. In memory; rebuilt from attachments after a restart. */
   private readonly peers = new Map<string, WebSocket>()
@@ -111,6 +113,7 @@ export class Gateway extends DurableObject<Env> {
     super(ctx, env)
     this.timing = resolveTiming(env)
     this.turn = resolveTurn(env)
+    this.turnCredentials = new TurnCredentialCache(env)
     // The schema statements run once per object instance. The DO is a singleton,
     // so this happens once per cold start, not per request — re-running them on
     // every access was a needless source of SQLite lock contention.
@@ -535,8 +538,18 @@ export class Gateway extends DurableObject<Env> {
     }
     link.stage = 'accepted'
     this.saveLink(link)
-    console.warn('link stage', { linkId: link.id, stage: link.stage, transports: link.preferredTransports })
+    console.warn('link stage', { linkId: link.id, stage: link.stage, transports: link.preferredTransports,
+      elapsedMs: Date.now() - link.created })
     if (clientSocket !== undefined) this.send(clientSocket, frame)
+    // Both endpoints are now authorized. Mint in parallel, before the client
+    // creates its offer, so the Host's later lookup does not add another mint
+    // round trip. Do not await this or gate signaling/hibernation on a timer.
+    if (link.preferredTransports.some(transport => transport !== 'relay') && this.turnEnabled
+      && this.turnLink(link.client, link.id) === link) {
+      this.ctx.waitUntil(Promise.all([
+        this.turnCredentials.get(link.client), this.turnCredentials.get(link.host),
+      ]).then(() => undefined))
+    }
   }
 
   private handleConnectRequest(
@@ -884,6 +897,7 @@ export class Gateway extends DurableObject<Env> {
       // Re-registering a device invalidates its old tokens, so a revoked credential
       // cannot be resurrected by re-registering.
       this.store.deleteTokensFor(input.deviceId)
+      this.turnCredentials.forget(input.deviceId)
       if (created) this.store.touchDevice(input.deviceId)
       return ok(await this.issueTokens(input.deviceId))
     } catch (error) { return fromThrown(error) }
@@ -923,6 +937,7 @@ export class Gateway extends DurableObject<Env> {
         // A reused refresh token means the previous response was intercepted or
         // replayed. Revoke the whole device rather than hand out a new pair.
         this.store.revokeDevice(deviceId)
+        this.turnCredentials.forget(deviceId)
         this.dropPeer(deviceId, 'AUTH_INVALID')
         return err('AUTH_INVALID', 401)
       }
@@ -932,25 +947,59 @@ export class Gateway extends DurableObject<Env> {
     } catch (error) { return fromThrown(error) }
   }
 
-  /** Validate a device access token; used by both the WS hello and the REST API. */
-  async authenticateDevice(accessToken: string): Promise<Result<{
+  /** Synchronous so authorization can be checked again after an upstream await. */
+  private authenticateDigest(digest: string): Result<{
     deviceId: string; role: 'host' | 'client'; name: string; platform: string
     identityKey: string; clientVersion: string; harnessVersion: string | null
-    revoked: boolean; lastSeenAt: number
-  }>> {
+    revoked: boolean; lastSeenAt: number; online: boolean
+  }> {
+    const record = this.store.findToken(digest)
+    if (record === null || record.kind !== 'access') return err('AUTH_INVALID', 401)
+    if (record.expires_at <= Date.now()) return err('TOKEN_EXPIRED', 401)
+    const device = this.store.getDevice(record.device_id)
+    if (device === null) return err('DEVICE_NOT_FOUND', 404)
+    if (device.revoked !== 0) return err('DEVICE_REVOKED', 403)
+    return ok({
+      deviceId: device.device_id, role: device.role, name: device.name, platform: device.platform,
+      identityKey: device.identity_key, clientVersion: device.client_version,
+      harnessVersion: device.harness_version, revoked: false, lastSeenAt: device.last_seen_at,
+      online: this.peers.has(device.device_id),
+    })
+  }
+
+  /** Validate a device access token and return presence in the same DO hop. */
+  async authenticateDevice(accessToken: string) {
+    try { return this.authenticateDigest(await sha256Hex(accessToken)) }
+    catch (error) { return fromThrown(error) }
+  }
+
+  /** The mandatory peer/pinned-key lookup, with fresh auth in a single DO RPC. */
+  async getAuthorizedPeer(accessToken: string, targetId: string) {
+    try {
+      const source = this.authenticateDigest(await sha256Hex(accessToken))
+      if (!source.ok) return source
+      const target = this.deviceSummary(targetId)
+      if (target === null) return err('DEVICE_NOT_FOUND', 404)
+      if (source.value.role === target.role) return err('MEMBERSHIP_REQUIRED', 403)
+      return ok(target)
+    } catch (error) { return fromThrown(error) }
+  }
+
+  /** Keep auth, active-link checks and credential reuse inside one DO hop. */
+  async getIceServers(accessToken: string, connectionId: string): Promise<Result<IceServer[]>> {
     try {
       const digest = await sha256Hex(accessToken)
-      const record = this.store.findToken(digest)
-      if (record === null || record.kind !== 'access') return err('AUTH_INVALID', 401)
-      if (record.expires_at <= Date.now()) return err('TOKEN_EXPIRED', 401)
-      const device = this.store.getDevice(record.device_id)
-      if (device === null) return err('DEVICE_NOT_FOUND', 404)
-      if (device.revoked !== 0) return err('DEVICE_REVOKED', 403)
-      return ok({
-        deviceId: device.device_id, role: device.role, name: device.name, platform: device.platform,
-        identityKey: device.identity_key, clientVersion: device.client_version,
-        harnessVersion: device.harness_version, revoked: false, lastSeenAt: device.last_seen_at,
-      })
+      const source = this.authenticateDigest(digest)
+      if (!source.ok) return source
+      const link = this.turnLink(source.value.deviceId, connectionId)
+      if (link === undefined) return err('CONNECTION_NOT_FOUND', 404)
+      const servers = await this.turnCredentials.get(source.value.deviceId)
+      // Minting yields. A revoke, refresh, close, replacement or deadline may
+      // have invalidated the caller meanwhile. No further await after this check.
+      const current = this.authenticateDigest(digest)
+      if (!current.ok) return current
+      if (this.turnLink(current.value.deviceId, connectionId) !== link) return err('CONNECTION_NOT_FOUND', 404)
+      return ok(servers ?? [])
     } catch (error) { return fromThrown(error) }
   }
 
@@ -978,10 +1027,9 @@ export class Gateway extends DurableObject<Env> {
     }))
   }
 
-  async getDevice(deviceId: string): Promise<{
-    deviceId: string; role: string; name: string; platform: string; identityKey: string
-    clientVersion: string; harnessVersion: string | null; lastSeenAt: number; online: boolean
-  } | null> {
+  async getDevice(deviceId: string) { return this.deviceSummary(deviceId) }
+
+  private deviceSummary(deviceId: string) {
     const device = this.store.getDevice(deviceId)
     if (device === null || device.revoked !== 0) return null
     return {
@@ -994,6 +1042,7 @@ export class Gateway extends DurableObject<Env> {
 
   async revokeDevice(deviceId: string): Promise<void> {
     this.store.revokeDevice(deviceId)
+    this.turnCredentials.forget(deviceId)
     this.dropPeer(deviceId, 'AUTH_INVALID')
   }
 
@@ -1001,13 +1050,23 @@ export class Gateway extends DurableObject<Env> {
     this.store.renameDevice(deviceId, name)
   }
 
-  /** True while both ends of the link are connected, used to authorize TURN. */
-  async authorizeTurn(deviceId: string, connectionId: string): Promise<boolean> {
+  /** True only during a live, unexpired link's negotiation window. */
+  private turnLink(deviceId: string, connectionId: string): Link | undefined {
     const link = this.links.get(connectionId)
-    if (link === undefined) return false
-    if (link.host !== deviceId && link.client !== deviceId) return false
-    if (link.stage !== 'accepted' && link.stage !== 'handshake') return false
-    return this.peers.has(link.host) && this.peers.has(link.client)
+    if (link === undefined || (link.host !== deviceId && link.client !== deviceId)) return
+    if (link.stage !== 'accepted' && link.stage !== 'handshake') return
+    if (Date.now() - link.created >= LINK_PENDING_TIMEOUT_MS) return
+    for (const id of [link.host, link.client]) {
+      const socket = this.peers.get(id)
+      if (socket?.readyState !== WebSocket.OPEN) return
+      const device = this.store.getDevice(id)
+      if (device === null || device.revoked !== 0) return
+    }
+    return link
+  }
+
+  async authorizeTurn(deviceId: string, connectionId: string): Promise<boolean> {
+    return this.turnLink(deviceId, connectionId) !== undefined
   }
 
   // --- lockout (kept here because SQLite is the only durable store) ---------
@@ -1062,11 +1121,11 @@ export class Gateway extends DurableObject<Env> {
     return this.store.takeOAuthToken(qrId)
   }
 
-  async setOAuthPkce(qrId: string, verifier: string): Promise<void> {
-    this.store.setOAuthPkce(qrId, verifier)
+  async setOAuthPkce(qrId: string, verifier: string): Promise<boolean> {
+    return this.store.setOAuthPkce(qrId, verifier)
   }
 
-  async getOAuthPkce(qrId: string): Promise<string | null> {
-    return this.store.getOAuthPkce(qrId)
+  async takeOAuthPkce(qrId: string): Promise<string | null> {
+    return this.store.takeOAuthPkce(qrId)
   }
 }

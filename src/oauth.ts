@@ -138,13 +138,13 @@ const STATE_TTL_SECONDS = 600
  * server uses a JWT; this is the same shape with HMAC-SHA256.
  */
 export async function signState(secret: string, input: {
-  providerId: string; returnTo: string; qrId: string | null; flowId?: string
+  providerId: string; returnTo: string; qrId: string | null; flowId?: string; nonce?: string
 }): Promise<string> {
   const now = Math.floor(Date.now() / 1000)
   const payload: OAuthState = {
     typ: `${input.providerId}-oauth-state`,
     returnTo: input.returnTo,
-    nonce: toBase64Url(crypto.getRandomValues(new Uint8Array(16))),
+    nonce: input.nonce ?? toBase64Url(crypto.getRandomValues(new Uint8Array(16))),
     qrId: input.qrId,
     ...(input.flowId === undefined ? {} : { flowId: input.flowId }),
     iat: now,
@@ -173,7 +173,7 @@ export async function verifyState(
   if (typeof parsed !== 'object' || parsed === null) return null
   const record = parsed as Record<string, unknown>
   if (record.typ !== `${expectedProviderId}-oauth-state`) return null
-  if (typeof record.returnTo !== 'string') return null
+  if (typeof record.returnTo !== 'string' || !isAllowedReturnTo(record.returnTo)) return null
   if (typeof record.nonce !== 'string' || record.nonce.length < 8) return null
   if (record.qrId !== null && typeof record.qrId !== 'string') return null
   if (record.flowId !== undefined && typeof record.flowId !== 'string') return null

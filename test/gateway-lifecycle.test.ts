@@ -6,10 +6,11 @@ import { createControlFrame, type ControlFrame } from '../src/protocol.js'
 vi.mock('../src/store.js', () => ({
   StoreError: class StoreError extends Error {},
   Store: class {
-    constructor(private storage: { devices: Map<string, Record<string, unknown>> }) {}
+    constructor(private storage: { devices: Map<string, Record<string, unknown>>; token: Record<string, unknown> | null }) {}
     getDevice(id: string) { return this.storage.devices.get(id) ?? null }
     listDevices() { return [...this.storage.devices.values()] }
-    findToken() { return { device_id: '00000000-0000-4000-8000-000000000002', kind: 'access', expires_at: Date.now() + 3_600_000 } }
+    findToken() { return this.storage.token }
+    revokeDevice(id: string) { const device = this.getDevice(id); if (device) device.revoked = 1 }
     touchDevice() {}
   },
 }))
@@ -43,15 +44,17 @@ function fixture(sockets = [peer(HOST, 'host'), peer(CLIENT, 'client')]) {
     device_id: id, role: id === HOST ? 'host' : 'client', revoked: 0,
     client_version: '0.6.3', identity_key: 'a'.repeat(42) + 'A', last_seen_at: Date.now(),
   }]))
-  const storage = { devices, getAlarm: vi.fn(async () => alarm),
+  const storage = { devices, token: { device_id: CLIENT, kind: 'access', expires_at: Date.now() + 3_600_000 } as Record<string, unknown> | null,
+    getAlarm: vi.fn(async () => alarm),
     setAlarm: vi.fn(async (value: number | Date) => { alarm = Number(value) }),
     deleteAlarm: vi.fn(async () => { alarm = null }) }
-  const state = { storage, getWebSockets: () => sockets }
+  const tasks: Promise<unknown>[] = []
+  const state = { storage, getWebSockets: () => sockets, waitUntil: (task: Promise<unknown>) => { tasks.push(task) } }
   const env = { TURN_KEY_ID: 'key', TURN_KEY_API_TOKEN: 'test', DSH_SERVER_ACCOUNT: 'owner@example.com' } as Env
   const wake = () => new Gateway(state as unknown as DurableObjectState, env)
   const message = (gateway: Gateway, socket: Socket, type: Parameters<typeof createControlFrame>[0], payload: Record<string, unknown>) =>
     gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify(createControlFrame(type, payload)))
-  return { sockets, storage, state, env, wake, message, alarm: () => alarm }
+  return { sockets, storage, state, env, wake, message, tasks, alarm: () => alarm }
 }
 async function openLink(f: ReturnType<typeof fixture>, gateway: Gateway, client = f.sockets[1]!) {
   await f.message(gateway, client, 'connect.request', { hostDeviceId: HOST, preferredTransports: ['p2p', 'turn', 'relay'] })
@@ -64,11 +67,19 @@ async function acceptLink(f: ReturnType<typeof fixture>, gateway: Gateway, conne
 }
 async function readyLink(f: ReturnType<typeof fixture>, gateway: Gateway, connectionId: string) {
   await acceptLink(f, gateway, connectionId)
+  await readyLinkAfterAccept(f, gateway, connectionId)
+}
+async function readyLinkAfterAccept(f: ReturnType<typeof fixture>, gateway: Gateway, connectionId: string) {
   await f.message(gateway, f.sockets[1]!, 'secure.handshake', { connectionId, targetDeviceId: HOST, step: 1, data: 'AAAA' })
   await f.message(gateway, f.sockets[0]!, 'secure.handshake', { connectionId, targetDeviceId: CLIENT, step: 2, data: 'AAAA' })
 }
 
-beforeEach(() => { vi.stubGlobal('WebSocket', Socket); vi.spyOn(console, 'warn').mockImplementation(() => {}) })
+beforeEach(() => {
+  vi.stubGlobal('WebSocket', Socket)
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ iceServers: [] })))
+  vi.spyOn(console, 'warn').mockImplementation(() => {})
+  vi.spyOn(console, 'info').mockImplementation(() => {})
+})
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('Gateway hibernation and replacement lifecycle', () => {
@@ -97,6 +108,66 @@ describe('Gateway hibernation and replacement lifecycle', () => {
     await f.message(gateway, f.sockets[0]!, 'secure.handshake', { connectionId: id, targetDeviceId: CLIENT, step: 2, data: 'AAAA' })
     expect(f.sockets[1]!.frames.at(-1)?.type).toBe('secure.handshake')
     expect(await gateway.authorizeTurn(CLIENT, id)).toBe(false)
+  })
+
+  it('prefetches both peer credentials concurrently without blocking acceptance, then reuses the host result', async () => {
+    let finish!: () => void
+    const pending = new Promise<void>(resolve => { finish = resolve })
+    const fetcher = vi.fn(async () => { await pending; return Response.json({ iceServers: [{ urls: 'turn:synthetic.example', credential: 'test-only' }] }) })
+    vi.stubGlobal('fetch', fetcher)
+    const f = fixture(), gateway = f.wake(), id = await openLink(f, gateway)
+    await acceptLink(f, gateway, id)
+    expect(f.sockets[1]!.frames.at(-1)?.type).toBe('connect.accepted')
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    const clientResult = gateway.getIceServers('test', id)
+    await f.message(gateway, f.sockets[1]!, 'ping', { nonce: 'while-minting' })
+    expect(f.sockets[1]!.frames.at(-1)?.type).toBe('pong')
+    finish()
+    expect(await clientResult).toMatchObject({ ok: true, value: [{ credential: 'test-only' }] })
+    f.storage.token!.device_id = HOST
+    expect(await gateway.getIceServers('host-test', id)).toMatchObject({ ok: true })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    const saved = JSON.stringify(f.sockets.map(socket => socket.deserializeAttachment()))
+    expect(saved).not.toContain('test-only')
+    expect(saved).not.toContain('synthetic.example')
+  })
+
+  it('rechecks token, revocation and link lifecycle after credential issuance yields', async () => {
+    const cases = ['revoked', 'token-expired', 'token-rotated', 'closed', 'ready', 'deadline', 'replacement'] as const
+    for (const scenario of cases) {
+      let finish!: () => void
+      const pending = new Promise<void>(resolve => { finish = resolve })
+      vi.stubGlobal('fetch', vi.fn(async () => { await pending; return Response.json({ iceServers: [{ urls: 'turn:synthetic.example' }] }) }))
+      const f = fixture(), gateway = f.wake(), id = await openLink(f, gateway)
+      await acceptLink(f, gateway, id)
+      const cache = (gateway as unknown as { turnCredentials: { get: (id: string) => Promise<unknown> } }).turnCredentials
+      const lookup = vi.spyOn(cache, 'get')
+      const result = gateway.getIceServers('test', id)
+      // The RPC must have passed its first auth check and joined the pending mint.
+      await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(1))
+      if (scenario === 'revoked') await gateway.revokeDevice(CLIENT)
+      if (scenario === 'token-expired') f.storage.token!.expires_at = Date.now() - 1
+      if (scenario === 'token-rotated') f.storage.token = null
+      if (scenario === 'closed') f.sockets[0]!.readyState = Socket.CLOSED
+      if (scenario === 'ready') await readyLinkAfterAccept(f, gateway, id)
+      if (scenario === 'deadline') {
+        const links = (gateway as unknown as { links: Map<string, { created: number }> }).links
+        links.get(id)!.created = Date.now() - 30_001
+      }
+      if (scenario === 'replacement') await openLink(f, gateway)
+      finish()
+      expect(await result, scenario).toMatchObject({ ok: false })
+      await Promise.all(f.tasks)
+    }
+  })
+
+  it('keeps fused peer authorization and presence fresh without dropping key or role checks', async () => {
+    const f = fixture(), gateway = f.wake()
+    expect(await gateway.getAuthorizedPeer('test', HOST)).toMatchObject({ ok: true, value: { deviceId: HOST, online: true, identityKey: 'a'.repeat(42) + 'A' } })
+    expect(await gateway.getAuthorizedPeer('test', CLIENT_B)).toMatchObject({ ok: false, code: 'MEMBERSHIP_REQUIRED' })
+    expect(await gateway.getAuthorizedPeer('test', 'unknown')).toMatchObject({ ok: false, code: 'DEVICE_NOT_FOUND' })
+    f.storage.devices.get(CLIENT)!.revoked = 1
+    expect(await gateway.getAuthorizedPeer('test', HOST)).toMatchObject({ ok: false, code: 'DEVICE_REVOKED' })
   })
 
   it('preserves Relay replay counters across a wake and never forwards a replay', async () => {

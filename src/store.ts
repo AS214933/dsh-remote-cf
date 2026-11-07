@@ -48,7 +48,7 @@ export interface DeviceInput {
   harness_version: string | null
 }
 
-let schemaReady = false
+const schemaReady = new WeakSet<SqlStorage>()
 
 export const LIMITS = {
   devices: 64,
@@ -82,7 +82,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS oauth_sessions (
     qr_id      TEXT PRIMARY KEY,
     provider   TEXT NOT NULL,
-    status     TEXT NOT NULL CHECK (status IN ('pending','complete','expired')),
+    status     TEXT NOT NULL CHECK (status IN ('pending','exchanging','complete','expired')),
     account    TEXT,
     is_admin   INTEGER,
     token      TEXT,
@@ -102,17 +102,24 @@ const SCHEMA = [
 export class Store {
   private readonly sql: SqlStorage
 
-  constructor(storage: DurableObjectStorage) {
+  constructor(private readonly storage: DurableObjectStorage) {
     // `cloudflare:workers` types are not installed here; the DO runtime provides
     // `storage.sql` with this exact shape.
     this.sql = (storage as unknown as { sql: SqlStorage }).sql
-    // Idempotent statements, but each one still takes a write lock. A Durable
-    // Object is a per-instance singleton, so a module-level flag is enough to make
-    // this once-per-cold-start instead of once-per-construction — which matters
-    // because construction happens on every RPC entry.
-    if (!schemaReady) {
-      for (const statement of SCHEMA) this.sql.exec(statement)
-      schemaReady = true
+    // Cache per database, not per module: multiple DO instances may share an isolate.
+    if (!schemaReady.has(this.sql)) {
+      storage.transactionSync(() => {
+        const oauthSchema = this.sql.exec<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'oauth_sessions'",
+        ).toArray()[0]?.sql
+        if (oauthSchema !== undefined && !oauthSchema.includes("'exchanging'")) {
+          // These are short-lived login attempts, not device credentials. Invalidate
+          // legacy flows rather than carry replayable verifiers into the new lifecycle.
+          this.sql.exec('DROP TABLE oauth_sessions')
+        }
+        for (const statement of SCHEMA) this.sql.exec(statement)
+      })
+      schemaReady.add(this.sql)
     }
   }
 
@@ -276,45 +283,57 @@ export class Store {
     }
   }
 
-  /**
-   * Mark a session complete and hand it the session token.
-   *
-   * Only a `pending` row may transition: a second callback for the same qr id would
-   * otherwise overwrite the token, and a callback replay is exactly what an attacker
-   * with a stolen `code` would attempt.
-   */
+  /** Only the callback that claimed a live verifier can complete the flow. */
   completeOAuthSession(qrId: string, account: string, isAdmin: boolean, token: string): boolean {
-    const existing = this.getOAuthSession(qrId)
-    if (existing === null || existing.status !== 'pending') return false
-    if (existing.expiresAt <= Date.now()) return false
-    this.sql.exec(
-      'UPDATE oauth_sessions SET status = ?, account = ?, is_admin = ?, token = ? WHERE qr_id = ? AND status = ?',
-      'complete', account, isAdmin ? 1 : 0, token, qrId, 'pending',
-    )
-    return true
+    return this.sql.exec(
+      `UPDATE oauth_sessions SET status = 'complete', account = ?, is_admin = ?, token = ?
+       WHERE qr_id = ? AND provider = 'logto' AND status = 'exchanging' AND expires_at > ?
+       RETURNING qr_id`,
+      account, isAdmin ? 1 : 0, token, qrId, Date.now(),
+    ).toArray().length === 1
   }
 
-  /** Read the token once; the row keeps its complete status but loses the token. */
+  /** Read the live token once; retain complete status so a landing cannot restart it. */
   takeOAuthToken(qrId: string): { account: string; isAdmin: boolean; token: string } | null {
-    const row = this.getOAuthSession(qrId)
-    if (row === null || row.status !== 'complete' || row.token === null || row.account === null) return null
-    this.sql.exec('UPDATE oauth_sessions SET token = NULL WHERE qr_id = ?', qrId)
-    return { account: row.account, isAdmin: row.isAdmin === 1, token: row.token }
+    return this.storage.transactionSync(() => {
+      const row = this.getOAuthSession(qrId)
+      if (row === null || row.provider !== 'logto' || row.status !== 'complete'
+        || row.expiresAt <= Date.now() || row.token === null || row.account === null) return null
+      this.sql.exec('UPDATE oauth_sessions SET token = NULL WHERE qr_id = ?', qrId)
+      return { account: row.account, isAdmin: row.isAdmin === 1, token: row.token }
+    })
   }
 
   purgeExpiredOAuthSessions(now = Date.now()): void {
     this.sql.exec('DELETE FROM oauth_sessions WHERE expires_at <= ?', now)
   }
 
-  setOAuthPkce(qrId: string, verifier: string): void {
-    this.sql.exec('UPDATE oauth_sessions SET pkce = ? WHERE qr_id = ?', verifier, qrId)
+  /** The first scanner owns the verifier; a reload must never replace it. */
+  setOAuthPkce(qrId: string, verifier: string): boolean {
+    if (verifier === '') return false
+    return this.sql.exec(
+      `UPDATE oauth_sessions SET pkce = ?
+       WHERE qr_id = ? AND provider = 'logto' AND status = 'pending' AND expires_at > ? AND pkce IS NULL
+       RETURNING qr_id`,
+      verifier, qrId, Date.now(),
+    ).toArray().length === 1
   }
 
-  getOAuthPkce(qrId: string): string | null {
-    const row = this.sql.exec<{ pkce: string | null }>(
-      'SELECT pkce FROM oauth_sessions WHERE qr_id = ?', qrId,
-    ).toArray()[0]
-    return row?.pkce ?? null
+  /** Atomically claim the flow before any provider await; only one callback wins. */
+  takeOAuthPkce(qrId: string): string | null {
+    return this.storage.transactionSync(() => {
+      const row = this.sql.exec<{ pkce: string }>(
+        `UPDATE oauth_sessions SET status = 'exchanging'
+         WHERE qr_id = ? AND provider = 'logto' AND status = 'pending' AND expires_at > ? AND pkce IS NOT NULL
+         RETURNING pkce`,
+        qrId, Date.now(),
+      ).toArray()[0]
+      if (row === undefined) return null
+      // SQLite RETURNING sees new values. Claim first, then erase the verifier in
+      // the same synchronous transaction so neither replay nor a reload can use it.
+      this.sql.exec('UPDATE oauth_sessions SET pkce = NULL WHERE qr_id = ?', qrId)
+      return row.pkce
+    })
   }
 
   purgeExpiredLockouts(now: number, streakMs: number): void {

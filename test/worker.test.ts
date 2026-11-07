@@ -110,6 +110,41 @@ describe('routes that must keep working', () => {
   })
 })
 
+describe('connection setup uses one authenticated Gateway RPC per critical lookup', () => {
+  it('preserves TURN response shape and forbids HTTP credential caching', async () => {
+    const getIceServers = vi.fn(async () => ({ ok: true, value: [{ urls: 'turn:synthetic.example' }] }))
+    const env = makeEnv({ GATEWAY: { getByName: () => ({ getIceServers }) } as unknown as Env['GATEWAY'] })
+    const response = await worker.fetch(new Request(`${PUBLIC_URL}/api/v1/turn/credentials?connection_id=test-link`,
+      { headers: { Authorization: 'Bearer synthetic-test-token' } }), env)
+    expect(response.status).toBe(200)
+    expect(response.headers.get('Cache-Control')).toBe('no-store')
+    expect(await response.json()).toEqual({ iceServers: [{ urls: 'turn:synthetic.example' }] })
+    expect(getIceServers).toHaveBeenCalledTimes(1)
+    expect(getIceServers).toHaveBeenCalledWith('synthetic-test-token', 'test-link')
+    getIceServers.mockResolvedValueOnce({ ok: false, code: 'CONNECTION_NOT_FOUND', status: 404 } as never)
+    const denied = await worker.fetch(new Request(`${PUBLIC_URL}/api/v1/turn/credentials?connection_id=gone`,
+      { headers: { Authorization: 'Bearer synthetic-test-token' } }), env)
+    expect(denied.status).toBe(404)
+  })
+
+  it('gets pinned peer and presence through the same fresh authorization operation', async () => {
+    const target = { deviceId: '00000000-0000-4000-8000-000000000001', role: 'host', name: 'test-host',
+      platform: 'test', identityKey: 'a'.repeat(43), clientVersion: '0.6.3', harnessVersion: null, online: true, lastSeenAt: 123 }
+    const getAuthorizedPeer = vi.fn(async () => ({ ok: true, value: target }))
+    const env = makeEnv({ GATEWAY: { getByName: () => ({ getAuthorizedPeer }) } as unknown as Env['GATEWAY'] })
+    for (const suffix of ['', '/presence']) {
+      const response = await worker.fetch(new Request(`${PUBLIC_URL}/api/v1/devices/${target.deviceId}${suffix}`,
+        { headers: { Authorization: 'Bearer synthetic-test-token' } }), env)
+      expect(response.status).toBe(200)
+      const data = await response.json() as Record<string, unknown>
+      expect(data.online).toBe(true)
+      if (suffix === '') expect(data.identityKey).toBe(target.identityKey)
+      else expect(data).toEqual({ deviceId: target.deviceId, online: true, lastSeenAt: 123 })
+    }
+    expect(getAuthorizedPeer).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('configuration guard', () => {
   it('refuses to serve with a short password', async () => {
     const env = makeEnv({ DSH_SERVER_PASSWORD: 'short' })

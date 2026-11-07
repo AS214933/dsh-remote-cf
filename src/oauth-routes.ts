@@ -26,6 +26,22 @@ import { toBase64Url } from './crypto.js'
 const SESSION_TTL_SECONDS = 600
 const PROVIDER_ID = 'logto'
 const PROVIDER_LABEL = 'Logto'
+const OAUTH_RESPONSE_HEADERS = {
+  'Cache-Control': 'no-store',
+  'Referrer-Policy': 'no-referrer',
+}
+
+function jsonResponse(body: unknown): Response {
+  return Response.json(body, { headers: OAUTH_RESPONSE_HEADERS })
+}
+
+/** Native clients omit Origin; browsers must match the configured public origin. */
+function allowedStartOrigin(request: Request, env: Env): boolean {
+  const origin = request.headers.get('Origin')
+  if (request.headers.get('Sec-Fetch-Site') === 'cross-site') return false
+  if (origin === null) return true
+  try { return origin === new URL(env.DSH_SERVER_PUBLIC_URL).origin } catch { return false }
+}
 
 export interface OAuthDeps {
   call<T>(method: string, args: unknown[]): Promise<T>
@@ -42,10 +58,10 @@ function qrId(): string {
 
 /** 303 so the browser follows with GET; 302 would let a POST callback re-POST. */
 function redirect(location: string, headers: Record<string, string> = {}): Response {
-  return new Response(null, { status: 303, headers: { Location: location, ...headers } })
+  return new Response(null, { status: 303, headers: { ...OAUTH_RESPONSE_HEADERS, Location: location, ...headers } })
 }
 
-function htmlPage(title: string, body: string, status = 200): Response {
+function htmlPage(title: string, body: string, status = 200, headers: Record<string, string> = {}): Response {
   const document = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -65,6 +81,7 @@ p{margin:.5rem 0;opacity:.85}
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'no-referrer',
       'X-Robots-Tag': 'noindex, nofollow',
+      ...headers,
     },
   })
 }
@@ -86,8 +103,8 @@ export function oauthConfigured(env: Env): boolean {
 export function providersResponse(env: Env): Response {
   // An empty list is the correct answer when unconfigured: the client then shows only
   // the password form, which is exactly what this deployment did before.
-  if (!oauthConfigured(env)) return Response.json({ items: [] })
-  return Response.json({
+  if (!oauthConfigured(env)) return jsonResponse({ items: [] })
+  return jsonResponse({
     items: [{
       id: PROVIDER_ID,
       displayName: PROVIDER_LABEL,
@@ -104,18 +121,21 @@ export function providersResponse(env: Env): Response {
 export async function startSession(
   request: Request, env: Env, deps: OAuthDeps,
 ): Promise<Response> {
+  if (!allowedStartOrigin(request, env)) {
+    return deps.errorResponse('AUTH_INVALID', 403, OAUTH_RESPONSE_HEADERS)
+  }
   deps.rate(`oauth-start:${deps.clientKey(request)}`, { max: 30, windowMs: 60_000 })
-  if (!oauthConfigured(env)) return deps.errorResponse('OAUTH_PROVIDER_UNAVAILABLE', 404)
+  if (!oauthConfigured(env)) return deps.errorResponse('OAUTH_PROVIDER_UNAVAILABLE', 404, OAUTH_RESPONSE_HEADERS)
 
   const url = new URL(request.url)
   const requested = url.searchParams.get('provider') ?? PROVIDER_ID
-  if (requested !== PROVIDER_ID) return deps.errorResponse('OAUTH_PROVIDER_UNAVAILABLE', 404)
+  if (requested !== PROVIDER_ID) return deps.errorResponse('OAUTH_PROVIDER_UNAVAILABLE', 404, OAUTH_RESPONSE_HEADERS)
 
   const id = qrId()
   const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000
   await deps.call<void>('createOAuthSession', [{ qrId: id, provider: PROVIDER_ID, expiresAt }])
 
-  return Response.json({
+  return jsonResponse({
     qrId: id,
     // The client requires this to start with the server origin; it is our landing page.
     scanUrl: `${env.DSH_SERVER_PUBLIC_URL}/api/v1/auth/q/${id}`,
@@ -133,21 +153,22 @@ export async function pollSession(
     account: string | null; isAdmin: number | null; token: string | null; expiresAt: number
   } | null>('getOAuthSession', [qrIdValue])
 
-  if (session === null) return Response.json({ status: 'expired' })
-  if (session.status === 'pending') {
-    // Expiry is a status, not an error: the client treats it as a state transition and
-    // stops polling, while an error would surface as a failure.
-    if (session.expiresAt <= Date.now()) return Response.json({ status: 'expired' })
-    return Response.json({ status: 'pending' })
+  // Expiry wins in every phase, including a completed flow not yet collected.
+  if (session === null || session.provider !== PROVIDER_ID || session.expiresAt <= Date.now()) {
+    return jsonResponse({ status: 'expired' })
   }
+  if (session.status === 'pending' || session.status === 'exchanging') {
+    return jsonResponse({ status: 'pending' })
+  }
+  if (session.status !== 'complete') return jsonResponse({ status: 'expired' })
 
   const taken = await deps.call<{ account: string; isAdmin: boolean; token: string } | null>(
     'takeOAuthToken', [qrIdValue],
   )
   // A completed session whose token was already collected reports expired: the token is
   // single-use, and re-serving it would defeat that.
-  if (taken === null) return Response.json({ status: 'expired' })
-  return Response.json({ status: 'complete', token: taken.token })
+  if (taken === null) return jsonResponse({ status: 'expired' })
+  return jsonResponse({ status: 'complete', token: taken.token })
 }
 
 // ---------------------------------------------------------------------------
@@ -170,23 +191,33 @@ export async function landingPage(
     qrId: string; provider: string; status: string; expiresAt: number
   } | null>('getOAuthSession', [qrIdValue])
 
-  if (session === null || session.expiresAt <= Date.now()) {
+  if (session === null || session.provider !== PROVIDER_ID || session.expiresAt <= Date.now()) {
     return htmlPage('登录已过期', '<p>这个二维码已失效，请在客户端重新发起登录。</p>', 410)
   }
   if (session.status === 'complete') {
     return htmlPage('已登录', '<p>授权已完成，可以关闭此页面。</p>')
   }
+  if (session.status === 'exchanging') {
+    return htmlPage('正在登录', '<p>授权正在处理，请回到客户端等待。</p>')
+  }
+  if (session.status !== 'pending') {
+    return htmlPage('登录已过期', '<p>这个二维码已失效，请在客户端重新发起登录。</p>', 410)
+  }
 
   const pkce = await createPkce()
   // The verifier is stored with the flow, not in a cookie: a phone scans the code while
   // the desktop client polls, so the two are different browsers with different jars.
-  await deps.call<void>('setOAuthPkce', [qrIdValue, pkce.verifier])
+  const prepared = await deps.call<boolean>('setOAuthPkce', [qrIdValue, pkce.verifier])
+  if (!prepared) {
+    return htmlPage('登录已开始', '<p>此二维码已被打开或已失效，请完成原页面的授权，或在客户端重新发起登录。</p>', 409)
+  }
 
+  const nonce = qrId()
   const state = await signState(env.SESSION_SECRET, {
-    providerId: PROVIDER_ID, returnTo: '/app', qrId: qrIdValue,
+    providerId: PROVIDER_ID, returnTo: '/app', qrId: qrIdValue, nonce,
   })
   const target = await buildSignInUrl(config, {
-    redirectUri: callbackUrl(env), state, challenge: pkce.challenge,
+    redirectUri: callbackUrl(env), state, challenge: pkce.challenge, nonce,
   })
   if (target === null) return htmlPage('登录不可用', '<p>无法连接认证服务。</p>', 502)
   return redirect(target, { 'Set-Cookie': stateCookie(env, state) })
@@ -219,16 +250,22 @@ export async function startRedirect(
   // Reuse the session row so the verifier has somewhere to live and the flow stays
   // visible in one table, even though no client is polling for this one.
   await deps.call<void>('createOAuthSession', [{ qrId: id, provider: PROVIDER_ID, expiresAt }])
-  await deps.call<void>('setOAuthPkce', [id, pkce.verifier])
+  const prepared = await deps.call<boolean>('setOAuthPkce', [id, pkce.verifier])
+  if (!prepared) return htmlPage('登录已过期', '<p>登录会话已失效，请重新发起。</p>', 410)
 
+  const nonce = qrId()
   const state = await signState(env.SESSION_SECRET, {
-    providerId: PROVIDER_ID, returnTo: requested, qrId: null, flowId: id,
+    providerId: PROVIDER_ID, returnTo: requested, qrId: null, flowId: id, nonce,
   })
   const target = await buildSignInUrl(config, {
-    redirectUri: callbackUrl(env), state, challenge: pkce.challenge,
+    redirectUri: callbackUrl(env), state, challenge: pkce.challenge, nonce,
   })
   if (target === null) return htmlPage('登录不可用', '<p>无法连接认证服务。</p>', 502)
   return redirect(target, { 'Set-Cookie': stateCookie(env, state) })
+}
+
+function clearStateCookie(env: Env): string {
+  return stateCookie(env, '').replace(`Max-Age=${SESSION_TTL_SECONDS}`, 'Max-Age=0')
 }
 
 function stateCookie(env: Env, value: string): string {
@@ -266,7 +303,9 @@ export async function handleCallback(
   if (code === '' || stateToken === '') return htmlPage('授权失败', '<p>回调缺少 code 或 state。</p>', 400)
 
   const state = await verifyState(env.SESSION_SECRET, stateToken, PROVIDER_ID)
-  if (state === null) return htmlPage('授权失败', '<p>state 无效或已过期，请重新登录。</p>', 400)
+  if (state === null || !isAllowedReturnTo(state.returnTo)) {
+    return htmlPage('授权失败', '<p>state 无效或已过期，请重新登录。</p>', 400)
+  }
 
   // Both copies must match. The state travels through the provider and can leak via a
   // referrer; the cookie proves this browser started the flow.
@@ -279,7 +318,7 @@ export async function handleCallback(
   // direct path it is the flow id carried in the state.
   const flowId = state.qrId ?? state.flowId ?? ''
   if (flowId === '') return htmlPage('授权失败', '<p>登录会话标识缺失。</p>', 400)
-  const verifier = await deps.call<string | null>('getOAuthPkce', [flowId])
+  const verifier = await deps.call<string | null>('takeOAuthPkce', [flowId])
   if (verifier === null) return htmlPage('登录已过期', '<p>登录会话已失效，请重新发起。</p>', 410)
 
   const tokens = await exchange(config, {
@@ -292,7 +331,7 @@ export async function handleCallback(
   if (tokens.idToken === undefined) {
     return htmlPage('授权失败', '<p>认证服务未返回 id_token，无法验证身份。</p>', 502)
   }
-  const claims = await verifyIdToken(config, tokens.idToken)
+  const claims = await verifyIdToken(config, tokens.idToken, state.nonce)
   if (claims === null) {
     return htmlPage('授权失败', '<p>身份令牌校验未通过。</p>', 502)
   }
@@ -315,12 +354,24 @@ export async function handleCallback(
       'completeOAuthSession', [state.qrId, account, false, session.token],
     )
     if (!completed) return htmlPage('登录已过期', '<p>二维码会话已失效，请在客户端重新发起登录。</p>', 410)
-    return htmlPage('授权完成', '<p>已登录，请回到客户端继续。</p>')
+    return htmlPage('授权完成', '<p>已登录，请回到客户端继续。</p>', 200, {
+      'Set-Cookie': clearStateCookie(env),
+    })
+  }
+
+  // The provider and session signer both yield. Direct flows also expire while
+  // exchanging, and must not deliver a token after their live window has ended.
+  const directFlow = await deps.call<{
+    provider: string; status: string; expiresAt: number
+  } | null>('getOAuthSession', [flowId])
+  if (directFlow === null || directFlow.provider !== PROVIDER_ID
+    || directFlow.status !== 'exchanging' || directFlow.expiresAt <= Date.now()) {
+    return htmlPage('登录已过期', '<p>登录会话已失效，请重新发起。</p>', 410)
   }
 
   const separator = state.returnTo.includes('?') ? '&' : '?'
   return redirect(`${state.returnTo}${separator}token=${encodeURIComponent(session.token)}`, {
-    'Set-Cookie': `${stateCookieName(PROVIDER_ID)}=; Path=/api/v1/auth; HttpOnly; Max-Age=0`,
+    'Set-Cookie': clearStateCookie(env),
   })
 }
 
