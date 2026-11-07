@@ -8,7 +8,20 @@ coverage/
 # committed. wrangler.local.jsonc is the real deployment config; wrangler.jsonc stays
 # a neutral template so this repository can be public.
 wrangler.local.jsonc
+wrangler.*.local.jsonc
 .dev.vars
+.dev.vars.*
 secrets.local
+*.secret.json
+*.secrets.json
 .env
 .env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.backup
+*.bak

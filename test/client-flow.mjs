@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Reproduce the plugin's actual sign-in flow.
  *
@@ -23,9 +24,7 @@ const REPO = process.env.DSH_REPO
 if (!REPO) { console.error('DSH_REPO must point at a ds-harness-remote checkout'); process.exit(2) }
 const toUrl = p => `file://${p.replace(/\\/g, '/')}`
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 const { HostServerApi } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/server-api.ts')))
 const { IdentityStore } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/identity-store.ts')))
@@ -47,7 +46,7 @@ async function main() {
   try {
     const providers = await clientApi.oauthProviders()
     ok('oauthProviders answered', `${providers.length} provider(s)`)
-    ok('empty list is the correct answer for a password-only server', providers.length === 0 ? 'none configured' : 'unexpected')
+    check('provider discovery returns a list', Array.isArray(providers), `${providers.length} provider(s); optional Logto is allowed`)
   } catch (error) {
     fail('oauthProviders', error instanceof Error ? `${error.name}: ${error.message}` : String(error))
   }
@@ -80,7 +79,7 @@ async function main() {
   let hostCredentials
   try {
     hostCredentials = await hostApi.authenticate(hostIdentity)
-    ok('Host credentials issued', `accessToken=${String(hostCredentials.accessToken).slice(0, 8)}…`)
+    check('Host access token issued', typeof hostCredentials.accessToken === 'string' && hostCredentials.accessToken.length > 0)
   } catch (error) {
     fail('Host authenticate', error instanceof Error ? `${error.name}: ${error.message}` : String(error))
     return report()
@@ -117,10 +116,7 @@ async function main() {
   try {
     const devices = await clientApi.listDevices()
     const found = devices.some(device => device.deviceId === hostIdentity.deviceId)
-    ok('client listDevices includes the host', found ? 'yes' : `no (${devices.length} device(s))`)
-    if (!found) {
-      for (const device of devices) console.log(`       ${device.role} ${device.deviceId.slice(0, 8)}… online=${device.online}`)
-    }
+    check('client listDevices includes the host', found, `${devices.length} device(s) returned`)
   } catch (error) {
     fail('client listDevices', error instanceof Error ? `${error.name}: ${error.message}` : String(error))
   }

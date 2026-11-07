@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Data-plane test: a real Noise IK tunnel carried through the server's relay.
  *
@@ -30,9 +31,7 @@ if (!REPO) {
 }
 const toUrl = p => `file://${p.replace(/\\/g, '/')}`
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 const { HostServerApi } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/server-api.ts')))
 const { IdentityStore } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/identity-store.ts')))
@@ -104,7 +103,7 @@ async function main() {
   const incoming = await take(host.frames, host.waiters, 'connect.incoming', 10_000)
   if (incoming === null) { fail('connect.incoming'); return report() }
   ok('host received connect.incoming', `authorization=${incoming.payload.authorization}`)
-  ok('server reported the client identity key', incoming.payload.clientIdentityKey === client.identity.publicKey)
+  check('server reported the client identity key', incoming.payload.clientIdentityKey === client.identity.publicKey)
 
   host.send('connect.accepted', { connectionId: incoming.payload.connectionId })
   const accepted = await take(client.frames, client.waiters, 'connect.accepted', 10_000)
@@ -159,7 +158,7 @@ async function main() {
   ok('host received the relay frame', `${delivered.payload.ciphertext.length} chars base64url`)
 
   const opened = new TextDecoder().decode(responder.decrypt(fromBase64Url(delivered.payload.ciphertext)))
-  ok('host decrypted to the original plaintext', opened === plaintext ? 'exact match' : `got "${opened}"`)
+  check('host decrypted to the original plaintext', opened === plaintext, 'decrypted payload must match exactly')
 
   console.log('\n=== 5. encrypted relay: host -> client ===')
   const reply = `reply through the tunnel ${randomUUID()}`
@@ -171,7 +170,7 @@ async function main() {
   const back = await take(client.frames, client.waiters, 'relay', 10_000)
   if (back === null) { fail('client received the reply'); return report() }
   const openedReply = new TextDecoder().decode(initiator.decrypt(fromBase64Url(back.payload.ciphertext)))
-  ok('client received and decrypted the reply', openedReply === reply ? 'exact match' : `got "${openedReply}"`)
+  check('client received and decrypted the reply', openedReply === reply, 'decrypted reply must match exactly')
 
   console.log('\n=== 6. a payload above the Noise message limit is chunked ===')
   // Noise caps one ciphertext at 65535 bytes, so anything larger must be split.
@@ -194,8 +193,8 @@ async function main() {
     if (text !== slice) mismatch = true
     received += text.length
   }
-  ok(!mismatch && received === big.length,
-    mismatch ? 'chunked relay failed' : `${Math.ceil(big.length / chunk)} chunks, ${received} bytes decrypted`)
+  check('chunked relay preserves the complete payload', !mismatch && received === big.length,
+    `${received}/${big.length} bytes decrypted`)
 
   // Runs last on purpose: refusing a rewound counter tears the link down, which is
   // correct server behaviour, so any later test would have no link to use.
@@ -205,7 +204,7 @@ async function main() {
     ciphertext: toBase64Url(initiator.encrypt(new TextEncoder().encode('replay attempt'))),
   })
   const refused = await take(client.frames, client.waiters, 'error', 5_000)
-  ok(refused !== null ? 'replay refused with an error frame' : 'replay was not refused',
+  check('replay refused with INVALID_MESSAGE', refused?.payload?.code === 'INVALID_MESSAGE',
     refused === null ? 'no error frame arrived' : String(refused.payload.code))
 
   try { client.socket.close(); host.socket.close() } catch { /* already closed */ }

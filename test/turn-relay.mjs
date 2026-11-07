@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Does the issued TURN credential actually work against Cloudflare's TURN service?
  *
@@ -27,9 +28,7 @@ const REPO = process.env.DSH_REPO
 if (!REPO) { console.error('DSH_REPO must point at a ds-harness-remote checkout'); process.exit(2) }
 const toUrl = p => `file://${p.replace(/\\/g, '/')}`
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 const { HostServerApi } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/server-api.ts')))
 const { IdentityStore } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/identity-store.ts')))
@@ -60,7 +59,8 @@ async function join(role, dir) {
       clientVersion: '0.4.15',
     },
   }))
-  await take(frames, 'hello.ack', 10_000)
+  const ack = await take(frames, 'hello.ack', 10_000)
+  if (ack === null) throw new Error(`${role}: no hello.ack`)
   return { role, identity, api, socket, frames, send: (type, payload) => socket.send(JSON.stringify({ v: 1, id: randomUUID(), type, timestamp: Date.now(), payload })) }
 }
 
@@ -101,8 +101,10 @@ async function main() {
   for (const server of iceServers) {
     const urls = Array.isArray(server.urls) ? server.urls : [server.urls]
     ok('  server entry', `${urls.join(', ').slice(0, 90)}`)
-    if (server.username !== undefined) ok('  has username', `${String(server.username).slice(0, 12)}…`)
-    if (server.credential !== undefined) ok('  has credential', `${String(server.credential).slice(0, 12)}…`)
+    if (urls.some(url => typeof url === 'string' && /^turns?:/.test(url))) {
+      check('  has TURN username', typeof server.username === 'string' && server.username.length > 0)
+      check('  has TURN credential', typeof server.credential === 'string' && server.credential.length > 0)
+    }
   }
 
   console.log('\n=== force TURN: host candidates disabled, so only relay can work ===')
@@ -113,6 +115,11 @@ async function main() {
   const pcHost = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' })
   ok('two peer connections with iceTransportPolicy=relay')
 
+  // Subscribe before SDP negotiation: the datachannel event can precede client open.
+  const hostChannelReady = new Promise(resolve => {
+    pcHost.addEventListener('datachannel', event => resolve(event.channel), { once: true })
+    setTimeout(() => resolve(null), 45_000)
+  })
   const channel = pcClient.createDataChannel('turn-test', { ordered: true })
   const opened = new Promise(resolve => {
     channel.addEventListener('open', () => resolve(true))
@@ -182,10 +189,7 @@ async function main() {
   const payload = `via turn ${randomUUID()}`
   // Attach the listener before the channel can fire; the `datachannel` event hands
   // over an already-usable channel, so a late attach would miss the message.
-  const hostChannel = await new Promise(resolve => {
-    pcHost.addEventListener('datachannel', event => resolve(event.channel))
-    setTimeout(() => resolve(null), 15_000)
-  })
+  const hostChannel = await hostChannelReady
   if (hostChannel === null) { fail('host never saw a data channel'); return report() }
 
   const arrived = new Promise(resolve => {
@@ -194,12 +198,13 @@ async function main() {
   })
   channel.send(payload)
   const got = await arrived
-  ok(got === payload ? 'payload relayed through TURN' : 'payload did not arrive',
-    got === null ? 'timeout' : String(got).slice(0, 40))
+  check('payload relayed through TURN', got === payload,
+    got === null ? 'timeout' : 'received data must match exactly')
 
   const stats = await pcClient.getStats?.()
   const localTypes = [...(stats?.values?.() ?? [])].filter(r => r.type === 'local-candidate').map(r => r.candidateType)
-  ok('only relayed candidates were gathered', JSON.stringify([...new Set(localTypes)]))
+  check('only relayed candidates were gathered', localTypes.length > 0 && localTypes.every(type => type === 'relay'),
+    JSON.stringify([...new Set(localTypes)]))
 
   try { pcClient.close(); pcHost.close(); client.socket.close(); host.socket.close() } catch { /* ignore */ }
   return report()

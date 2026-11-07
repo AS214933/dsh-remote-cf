@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Soak: does a connection survive on the real edge?
  *
@@ -23,13 +24,15 @@ if (!baseUrl || !email || !password) {
   process.exit(2)
 }
 const MINUTES = Number(minutesArg ?? '20')
+if (!Number.isFinite(MINUTES) || MINUTES < 2) {
+  console.error('minutes must be a finite number >= 2 so heartbeat spacing can be measured')
+  process.exit(2)
+}
 const REPO = process.env.DSH_REPO
 if (!REPO) { console.error('DSH_REPO must point at a ds-harness-remote checkout'); process.exit(2) }
 const toUrl = p => `file://${p.replace(/\\/g, '/')}`
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 const { HostServerApi } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/server-api.ts')))
 const { IdentityStore } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/identity-store.ts')))
@@ -87,6 +90,7 @@ async function join(role, dir) {
     acked = frames.some(f => f.type === 'hello.ack')
     if (!acked) await new Promise(r => setTimeout(r, 100))
   }
+  if (!acked) throw new Error(`${role}: no hello.ack`)
   return {
     role, identity, socket, frames,
     get pings() { return pings }, get pongs() { return pongs }, get closed() { return closed },
@@ -173,21 +177,24 @@ async function main() {
   const clientPings = client.pings.length - baselineClient
   const expected = Math.floor((MINUTES * 60_000) / 25_000)
 
-  ok(`host survived ${MINUTES} min`, `${hostPings} pings (expected ~${expected}), close=${host.closed?.code ?? 'none'}`)
-  ok(`client survived ${MINUTES} min`, `${clientPings} pings (expected ~${expected}), close=${client.closed?.code ?? 'none'}`)
-  ok('no unexpected close', host.closed === null && client.closed === null,
+  check(`host survived ${MINUTES} min`, host.closed === null && host.socket.readyState === WebSocket.OPEN && Date.now() >= deadline,
+    `${hostPings} pings (expected ~${expected}), close=${host.closed?.code ?? 'none'}`)
+  check(`client survived ${MINUTES} min`, client.closed === null && client.socket.readyState === WebSocket.OPEN && Date.now() >= deadline,
+    `${clientPings} pings (expected ~${expected}), close=${client.closed?.code ?? 'none'}`)
+  check('no unexpected close', host.closed === null && client.closed === null,
     host.closed === null && client.closed === null ? 'both still open' : `host=${host.closed?.code} client=${client.closed?.code}`)
 
-  // Spacing: a heartbeat that fires in a burst and then stops would still produce the
-  // right count. The gap distribution catches that.
-  const gaps = intervals(host.pings).map(ms => Math.round(ms / 1000))
-  if (gaps.length > 2) {
-    const min = Math.min(...gaps)
-    const max = Math.max(...gaps)
-    ok('heartbeat spacing is steady', `${min}–${max}s (expected 25s±)`)
-    ok('no missed beats', max <= 60, max <= 60 ? 'no gap over 60s' : `gap of ${max}s`)
-  } else {
-    fail('not enough pings to measure spacing', `${gaps.length} interval(s)`)
+  // Include both soak boundaries: an early burst followed by silence must fail,
+  // even when the interval count alone would look healthy.
+  const soakStartedAt = deadline - MINUTES * 60_000
+  const soakEndedAt = Date.now()
+  for (const [name, peer] of [['host', host], ['client', client]]) {
+    const observed = peer.pings.filter(time => time >= soakStartedAt)
+    check(`${name} has enough heartbeat observations`, observed.length >= 3, `${observed.length} ping(s)`)
+    const gaps = intervals([soakStartedAt, ...observed, soakEndedAt])
+    const maxGapMs = Math.max(...gaps)
+    console.log(`  ${name} maximum heartbeat gap: ${Math.round(maxGapMs / 1000)}s (including soak boundaries)`)
+    check(`${name} has no heartbeat silence over 60s`, maxGapMs <= 60_000)
   }
 
   console.log('\n=== the link still routes after the wait ===')
@@ -201,7 +208,7 @@ async function main() {
   const delivered = await waitFor(host.frames, 'relay', 15_000)
   if (delivered === null) { fail('post-soak relay'); return report() }
   const text = new TextDecoder().decode(responder.decrypt(fromBase64Url(delivered.payload.ciphertext)))
-  ok('relay still works after the soak', text === payload ? 'exact match' : 'mismatch')
+  check('relay still works after the soak', text === payload, 'decrypted payload must match exactly')
 
   host.send('relay', {
     connectionId, targetDeviceId: client.identity.deviceId, counter: 1000,
@@ -209,7 +216,8 @@ async function main() {
   })
   const back = await waitFor(client.frames, 'relay', 15_000)
   if (back === null) { fail('post-soak reply'); return report() }
-  ok('reverse direction still works')
+  const reply = new TextDecoder().decode(initiator.decrypt(fromBase64Url(back.payload.ciphertext)))
+  check('reverse direction still works', reply === `reply ${payload}`, 'decrypted reply must match exactly')
 
   try { client.socket.close(); host.socket.close() } catch { /* already closed */ }
   return report()

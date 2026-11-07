@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * End-to-end: an RPC call from client to host through the server, inside the tunnel.
  *
@@ -27,9 +28,7 @@ const REPO = process.env.DSH_REPO
 if (!REPO) { console.error('DSH_REPO must point at a ds-harness-remote checkout'); process.exit(2) }
 const toUrl = p => `file://${p.replace(/\\/g, '/')}`
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 const { HostServerApi } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/server-api.ts')))
 const { IdentityStore } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/identity-store.ts')))
@@ -68,7 +67,8 @@ async function join(role, dir) {
       clientVersion: '0.4.15', ...(role === 'host' ? { harnessVersion: '0.2.2' } : {}),
     },
   }))
-  await take(frames, 'hello.ack', 10_000)
+  const ack = await take(frames, 'hello.ack', 10_000)
+  if (ack === null) throw new Error(`${role}: no hello.ack`)
   return {
     role, identity, frames,
     send: (type, payload) => socket.send(JSON.stringify({ v: 1, id: randomUUID(), type, timestamp: Date.now(), payload })),
@@ -154,14 +154,14 @@ async function main() {
   // contains no recognisable plaintext.
   const rawCiphertext = delivered.payload.ciphertext
   const leaked = rawCiphertext.includes('PLAINTEXT') || rawCiphertext.includes('directory.list')
-  ok(leaked ? 'ciphertext leaked plaintext' : 'ciphertext carries no readable plaintext',
-    leaked ? 'SERVER COULD READ IT' : 'opaque as designed')
+  check('relayed ciphertext contains no literal marker or method', !leaked,
+    'literal-marker check only; not proof about every server log or decryption capability')
 
   const opened = new TextDecoder().decode(responder.decrypt(fromBase64Url(rawCiphertext)))
   const received = JSON.parse(opened)
-  ok('host decrypted the RPC request', `${received.type} ${received.payload.method}`)
-  ok('params survived intact', received.payload.params.marker === 'PLAINTEXT-MARKER-SHOULD-NEVER-APPEAR-IN-LOGS'
-    ? 'exact' : 'mismatch')
+  check('host decrypted the RPC request', received.type === 'rpc.request' && received.id === requestId
+    && received.payload?.method === 'directory.list')
+  check('params survived intact', received.payload?.params?.marker === 'PLAINTEXT-MARKER-SHOULD-NEVER-APPEAR-IN-LOGS')
 
   console.log('\n=== rpc.response back through the tunnel ===')
   const rpcResponse = {
@@ -178,13 +178,12 @@ async function main() {
   const back = await take(client.frames, 'relay', 10_000)
   if (back === null) { fail('rpc.response relayed'); return report() }
   const answered = JSON.parse(new TextDecoder().decode(initiator.decrypt(fromBase64Url(back.payload.ciphertext))))
-  ok('client decrypted the response', `${answered.type} matched=${answered.id === received.id}`)
-  ok('result arrived intact', Array.isArray(answered.payload.result.entries) ? 'entries present' : 'malformed')
+  check('client decrypted the matching RPC response', answered.type === 'rpc.response' && answered.id === requestId
+    && answered.payload?.requestId === requestId)
+  check('result arrived intact', JSON.stringify(answered.payload?.result) === JSON.stringify(rpcResponse.payload.result))
 
-  console.log('\n=== the server never parsed any rpc frame ===')
-  // Every frame the gateway was asked to route is a `relay` control frame; the inner
-  // `rpc.*` types exist only inside the ciphertext.
-  ok('gateway frames were all control frames', 'relay + signal only, rpc.* never reached the server')
+  console.log('\nThis script sent RPC objects only inside encrypted relay payloads.')
+  console.log('Server log inspection and inability-to-decrypt are separate review claims, not a test assertion here.')
 
   try { client.frames.length = 0; host.frames.length = 0 } catch { /* ignore */ }
   return report()

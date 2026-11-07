@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Validate every peer/device response against the client's own parsers.
  *
@@ -21,9 +22,7 @@ const REPO = process.env.DSH_REPO
 if (!REPO) { console.error('DSH_REPO must point at a ds-harness-remote checkout'); process.exit(2) }
 const toUrl = p => `file://${p.replace(/\\/g, '/')}`
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 const { HostServerApi } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/server-api.ts')))
 const { IdentityStore } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/identity-store.ts')))
@@ -51,15 +50,18 @@ async function main() {
     hosts = await clientApi.listDevices()
     ok('listDevices parsed by the client', `${hosts.length} host(s)`)
     const mine = hosts.find(h => h.deviceId === hostIdentity.deviceId)
-    ok('the new host is listed', mine === undefined ? 'NOT LISTED' : `name=${mine.name} online=${mine.online}`)
+    check('the new host is listed', mine !== undefined)
     // The list must NOT carry identityKey — the client pins keys from the peer endpoint.
-    const raw = await fetch(`${baseUrl}/api/v1/devices`, {
+    const response = await fetch(`${baseUrl}/api/v1/devices`, {
       headers: { Authorization: `Bearer ${clientCreds.accessToken}` },
-    }).then(r => r.json())
-    const leaked = (raw.items ?? []).some(item => item.identityKey !== undefined)
-    ok(leaked ? 'list leaks identityKey' : 'list omits identityKey', leaked ? 'SHOULD BE STRIPPED' : 'as designed')
-    const missingMembership = (raw.items ?? []).some(item => typeof item.membershipId !== 'string')
-    ok(missingMembership ? 'list misses membershipId' : 'list has membershipId')
+    })
+    check('raw device list answers successfully', response.ok, `HTTP ${response.status}`)
+    const raw = await response.json()
+    check('raw device list has items', Array.isArray(raw.items))
+    const leaked = raw.items.some(item => item.identityKey !== undefined)
+    check('list omits identityKey', !leaked)
+    const missingMembership = raw.items.some(item => typeof item.membershipId !== 'string')
+    check('list has membershipId', !missingMembership)
   } catch (error) {
     fail('listDevices', error instanceof Error ? error.message : String(error))
     return report()
@@ -70,8 +72,8 @@ async function main() {
     // This is the call that produced "invalid authorized peer data".
     const peer = await clientApi.deviceFor(hostIdentity.deviceId)
     ok('deviceFor parsed by the client')
-    ok('  identityKey present', `${String(peer.identityKey).slice(0, 12)}…`)
-    ok('  role', String(peer.role))
+    check('  identityKey matches registered host', peer.identityKey === hostIdentity.publicKey)
+    check('  role is host', peer.role === 'host')
   } catch (error) {
     fail('deviceFor', error instanceof Error ? `${error.name}: ${error.message}` : String(error))
   }
@@ -79,7 +81,7 @@ async function main() {
   console.log('\n=== 3. presence (used by the online badge) ===')
   try {
     const presence = await clientApi.presenceFor(hostIdentity.deviceId)
-    ok('presenceFor parsed by the client', `online=${presence.online}`)
+    check('presenceFor has a boolean online state', typeof presence.online === 'boolean', `online=${presence.online}`)
   } catch (error) {
     fail('presenceFor', error instanceof Error ? `${error.name}: ${error.message}` : String(error))
   }

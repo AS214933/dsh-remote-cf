@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Contract check: every endpoint the shipped plugin calls must be implemented.
  *
@@ -6,9 +7,9 @@
  * it extracts the paths the plugin actually requests, from the plugin's own source,
  * and asserts this server answers each one with something other than "unknown route".
  *
- * It cannot judge whether the semantics are right, but it does guarantee that no
- * endpoint is simply missing — which is the failure mode that produced a login that
- * appeared to work and then showed an empty host list.
+ * This is only a route-presence diagnostic, not a semantic contract proof. An
+ * authorization/validation error may indicate a handler, but cannot establish that
+ * the requested operation works. Server errors are failures, never route proof.
  *
  *   npx tsx endpoint-contract.mjs <server-url> <email> <password>
  */
@@ -23,9 +24,7 @@ if (!baseUrl || !email || !password) {
 const REPO = process.env.DSH_REPO
 if (!REPO) { console.error('DSH_REPO must point at a ds-harness-remote checkout'); process.exit(2) }
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 const source = readFileSync(joinPath(REPO, 'packages/plugin/src/server-api.ts'), 'utf8')
 
@@ -43,9 +42,9 @@ for (const match of source.matchAll(/`(\/api\/v1\/[^`]+)`/g)) {
     .replace(/\$\{[^}]+\}/g, '__x__'))
 }
 
-// Endpoints that legitimately do not exist on a password-only single-account server.
+// Optional surfaces are outside this password-flow route-presence diagnostic.
 const OPTIONAL = [
-  // OAuth is not configured; the plugin treats 404 as "no providers" and falls back.
+  // OAuth needs its own configured OIDC flow, not arbitrary GET/POST probes.
   /^\/api\/v1\/auth\/oauth\//,
   // Registration codes authorize a Host without an account, which this deployment
   // does not offer — it has an account, so the UI offers the account path.
@@ -97,16 +96,21 @@ for (const raw of [...paths].sort()) {
     })
     results.push({ method, status: response.status })
   }
-  // A route exists if any method got past "no such route". 404 from the API layer is
-  // ambiguous, so treat both 404 and 405 as missing only when both methods say so.
-  const exists = results.some(r => r.status !== 404 && r.status !== 405)
-  if (exists) {
-    ok(raw, results.map(r => `${r.method} ${r.status}`).join(', '))
+  const detail = results.map(r => `${r.method} ${r.status}`).join(', ')
+  // A 5xx response does not demonstrate a healthy handler. 4xx (other than
+  // 404/405) is only presence evidence, not proof of successful semantics.
+  const serverError = results.some(r => r.status >= 500)
+  const exists = results.some(r => r.status >= 200 && r.status < 500 && r.status !== 404 && r.status !== 405)
+  if (serverError) {
+    fail(raw, `server error during probe: ${detail}`)
+  } else if (exists) {
+    check(`route-presence evidence: ${raw}`, exists, detail)
   } else {
-    fail(raw, `both methods 404/405 — endpoint not implemented`)
+    fail(raw, `no supported method observed: ${detail}`)
     missing += 1
   }
 }
 
-console.log(`\n${steps.length - steps.filter(s => !s).length} passed, ${missing} missing`)
-process.exit(missing === 0 ? 0 : 1)
+const failed = steps.filter(s => !s).length
+console.log(`\n${steps.length - failed} route-presence checks passed, ${failed} failed (${missing} missing)`)
+process.exit(failed === 0 ? 0 : 1)

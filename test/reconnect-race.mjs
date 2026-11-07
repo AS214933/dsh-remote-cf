@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Reproduce the CONNECTION_REPLACED loop.
  *
@@ -9,9 +10,6 @@
  *
  *   node test/reconnect-race.mjs <server-url> <email> <password>
  */
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join as joinPath } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 const [baseUrl, email, password] = process.argv.slice(2)
@@ -20,9 +18,7 @@ if (!baseUrl || !email || !password) {
   process.exit(2)
 }
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 function ulid() {
   const alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
@@ -106,8 +102,8 @@ async function main() {
   console.log('\n=== 1. both connect ===')
   const hostSocket = await connect(host, 'host')
   const clientSocket = await connect(client, 'client')
-  ok('host hello', hostSocket.frames.some(f => f.type === 'hello.ack') ? 'ack' : 'NO ACK')
-  ok('client hello', clientSocket.frames.some(f => f.type === 'hello.ack') ? 'ack' : 'NO ACK')
+  check('host hello', hostSocket.frames.some(f => f.type === 'hello.ack'))
+  check('client hello', clientSocket.frames.some(f => f.type === 'hello.ack'))
 
   console.log('\n=== 2. link them ===')
   clientSocket.socket.send(JSON.stringify({
@@ -120,7 +116,8 @@ async function main() {
     v: 1, id: randomUUID(), type: 'connect.accepted', timestamp: Date.now(),
     payload: { connectionId: incoming.payload.connectionId },
   }))
-  ok('link established', incoming.payload.connectionId.slice(0, 8))
+  const accepted = await waitFor(clientSocket.frames, 'connect.accepted', 10_000)
+  check('link acceptance reaches the client', accepted?.payload?.connectionId === incoming.payload.connectionId)
 
   console.log('\n=== 3. client drops and reconnects immediately ===')
   // A client that reconnects before the server has processed the close looks like two
@@ -128,9 +125,9 @@ async function main() {
   clientSocket.socket.close()
   const second = await connect(client, 'client')
   await new Promise(r => setTimeout(r, 1500))
-  ok('reconnected', second.frames.some(f => f.type === 'hello.ack') ? 'ack' : 'NO ACK')
+  check('reconnected', second.frames.some(f => f.type === 'hello.ack'))
   const replaced = second.frames.find(f => f.type === 'error' && f.payload?.code === 'CONNECTION_REPLACED')
-  ok('no CONNECTION_REPLACED on the new socket', replaced === undefined,
+  check('no CONNECTION_REPLACED on the new socket', replaced === undefined,
     replaced === undefined ? 'clean' : 'GOT CONNECTION_REPLACED')
 
   console.log('\n=== 4. can the reconnected client open a link again? ===')
@@ -139,7 +136,7 @@ async function main() {
     payload: { hostDeviceId: host.deviceId, preferredTransports: ['relay'] },
   }))
   const incoming2 = await waitFor(hostSocket.frames, 'connect.incoming', 10_000)
-  ok('second connect.request reaches the host', incoming2 !== null,
+  check('second connect.request reaches the host', incoming2 !== null,
     incoming2 === null ? 'host never saw it' : incoming2.payload.connectionId.slice(0, 8))
 
   console.log('\n=== 5. a second client joining must not evict the first ===')
@@ -157,11 +154,17 @@ async function main() {
     payload: { hostDeviceId: host.deviceId, preferredTransports: ['relay'] },
   }))
   const incoming3 = await waitFor(hostSocket.frames, 'connect.incoming', 10_000)
-  ok('third connect.request reaches the host', incoming3 !== null,
-    incoming3 === null ? 'host never saw it' : 'the modern host accepted another link')
+  check('third connect.request reaches the host', incoming3 !== null,
+    incoming3 === null ? 'host never saw it' : 'modern host received another request')
+  hostSocket.socket.send(JSON.stringify({
+    v: 1, id: randomUUID(), type: 'connect.accepted', timestamp: Date.now(),
+    payload: { connectionId: incoming3.payload.connectionId },
+  }))
+  const acceptedB = await waitFor(clientBSocket.frames, 'connect.accepted', 10_000)
+  check('second client receives acceptance', acceptedB?.payload?.connectionId === incoming3.payload.connectionId)
   const evicted = second.frames.find(f => f.type === 'error' && f.payload?.code === 'CONNECTION_REPLACED')
-  ok('the first client was not evicted', evicted === undefined,
-    evicted === undefined ? 'both links alive' : 'FIRST CLIENT EVICTED')
+  check('the first client was not evicted', evicted === undefined && second.closed === null && second.socket.readyState === WebSocket.OPEN,
+    evicted === undefined ? `close=${second.closed ?? 'none'}` : 'FIRST CLIENT EVICTED')
 
   try {
     second.socket.close(); clientBSocket.socket.close(); hostSocket.socket.close()

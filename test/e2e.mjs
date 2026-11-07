@@ -5,26 +5,21 @@
  * verify that the SQLite store, the WebSocket gateway and the alarm heartbeat
  * behave as designed under the actual runtime.
  *
- * Requires a mock Logto, because the real credential path needs an IdP. The dev
- * environment is pointed at a local stub that implements just the two endpoints
- * the auth module uses.
+ * Requires a disposable password-enabled local development instance. This is not
+ * Logto/OIDC coverage; use test/oauth-flow.test.mjs and test/oauth-runtime.mjs for
+ * isolated current OIDC checks. Never point this mutating script at production.
  *
  *   node test/e2e.mjs
  */
-const BASE = process.env.E2E_BASE ?? 'http://127.0.0.1:8787'
+import { createManualChecks } from './manual-check.mjs'
+const BASE = process.env.E2E_BASE ?? 'http://127.0.0.1:8790'
 // Must match .dev.vars.
 const ACCOUNT = process.env.E2E_ACCOUNT ?? 'owner@example.com'
 // Must match the password in wrangler.dev.jsonc; override with E2E_PASSWORD when
 // running against something other than a local `wrangler dev`.
 const PASSWORD = process.env.E2E_PASSWORD ?? 'local-dev-only'
 
-let passed = 0
-let failed = 0
-
-function check(name, condition, detail = '') {
-  if (condition) { passed += 1; console.log(`  ok   ${name}`) }
-  else { failed += 1; console.log(`  FAIL ${name}${detail ? ` — ${detail}` : ''}`) }
-}
+const { steps, check } = createManualChecks()
 
 async function post(path, body, headers = {}) {
   const response = await fetch(`${BASE}${path}`, {
@@ -74,7 +69,7 @@ async function main() {
 
   console.log('\n=== login (single account) ===')
   const login = await post('/api/v1/auth/login', { email: ACCOUNT, password: PASSWORD })
-  check('login succeeds', login.status === 200, `got ${login.status} ${JSON.stringify(login.data)}`)
+  check('login succeeds', login.status === 200, `got ${login.status}`)
   check('login returns the client contract', login.data !== null
     && typeof login.data.token === 'string'
     && typeof login.data.account === 'string'
@@ -95,7 +90,7 @@ async function main() {
       identityKey: identityKey(), clientVersion: '0.4.15', harnessVersion: '0.2.2',
     },
   }, sessionHeaders)
-  check('host registers', host.status === 200, `got ${host.status} ${JSON.stringify(host.data)}`)
+  check('host registers', host.status === 200, `got ${host.status}`)
   check('host gets an access token', typeof host.data?.accessToken === 'string')
 
   const client = await post('/api/v1/devices/register', {
@@ -160,7 +155,8 @@ async function main() {
   const bad = await wsHandshake('not-a-token', ulid())
   check('bad token closes the socket', !bad.acked, bad.detail)
 
-  console.log(`\n${passed} passed, ${failed} failed`)
+  const failed = steps.filter(step => !step).length
+  console.log(`\n${steps.length - failed} passed, ${failed} failed`)
   process.exit(failed === 0 ? 0 : 1)
 }
 

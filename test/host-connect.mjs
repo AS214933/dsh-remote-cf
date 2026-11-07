@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * Connect the REAL Host plugin client to the Cloudflare Workers server.
  *
@@ -26,12 +27,11 @@ if (!baseUrl || !email || !password) {
   process.exit(2)
 }
 
-const REPO = process.env.DSH_REPO ?? 'E:\\ds-harness-remote-server-workers\\repo'
+const REPO = process.env.DSH_REPO
+if (!REPO) { console.error('DSH_REPO must point at a ds-harness-remote checkout'); process.exit(2) }
 const toUrl = p => `file://${p.replaceAll('\\', '/')}`
 
-const steps = []
-const ok = (name, detail = '') => { steps.push({ name, pass: true }); console.log(`  ok   ${name}${detail ? ` — ${detail}` : ''}`) }
-const fail = (name, detail = '') => { steps.push({ name, pass: false }); console.log(`  FAIL ${name}${detail ? ` — ${detail}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 
 async function main() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-host-'))
@@ -58,8 +58,8 @@ async function main() {
     const store = new IdentityStore({ directory: dir })
     identity = await store.loadOrCreate(`cf-test-${process.pid}`)
     ok('identity created', `deviceId=${identity.deviceId}`)
-    ok('public key present', `${String(identity.publicKey).length} chars`)
-    ok('private key stays local', String(identity.privateKey).length > 0)
+    check('public key present', typeof identity.publicKey === 'string' && identity.publicKey.length > 0)
+    check('local private key present', typeof identity.privateKey === 'string' && identity.privateKey.length > 0)
   } catch (error) {
     fail('IdentityStore.loadOrCreate', error instanceof Error ? `${error.name}: ${error.message}` : String(error))
     return report()
@@ -80,8 +80,8 @@ async function main() {
   let credentials
   try {
     credentials = await api.authenticate(identity)
-    ok('authenticate returned credentials', `accessToken=${String(credentials.accessToken).slice(0, 8)}…`)
-    ok('refresh token present', String(credentials.refreshToken).length > 0)
+    check('authenticate returned an access token', typeof credentials.accessToken === 'string' && credentials.accessToken.length > 0)
+    check('refresh token present', typeof credentials.refreshToken === 'string' && credentials.refreshToken.length > 0)
   } catch (error) {
     fail('authenticate', error instanceof Error ? `${error.name}: ${error.message}` : String(error))
     return report()
@@ -92,10 +92,9 @@ async function main() {
     const devices = await api.listDevices()
     ok('listDevices', `${devices.length} device(s)`)
   } catch (error) {
-    // A host listing hosts may be refused by design; either way it must be a clean
-    // protocol error, not a 500.
+    // An arbitrary exception is not proof of a clean protocol response.
     const message = error instanceof Error ? error.message : String(error)
-    ok('listDevices answered cleanly', message.slice(0, 70))
+    fail('listDevices', message.slice(0, 70))
   }
 
   console.log('\n=== 6. control WebSocket: the exact hello server-connection.ts sends ===')
@@ -111,15 +110,15 @@ async function main() {
   }
   const ack = wsResult.ack
   ok('hello.ack received')
-  ok('protocol version', String(ack.protocol))
-  ok('heartbeat interval', `${ack.heartbeatIntervalMs}ms`)
-  ok('relay frame cap', `${ack.maxRelayFrameBytes}B`)
-  ok('negotiated capabilities', JSON.stringify(ack.capabilities))
-  ok('webrtc advertised', String(ack.webrtcEnabled))
+  check('protocol version', ack.protocol === 1, String(ack.protocol))
+  check('heartbeat interval', Number.isFinite(ack.heartbeatIntervalMs) && ack.heartbeatIntervalMs > 0, `${ack.heartbeatIntervalMs}ms`)
+  check('relay frame cap', Number.isFinite(ack.maxRelayFrameBytes) && ack.maxRelayFrameBytes > 0, `${ack.maxRelayFrameBytes}B`)
+  check('negotiated capabilities', Array.isArray(ack.capabilities) && ack.capabilities.includes('transport.relay'))
+  check('webrtc availability field', typeof ack.webrtcEnabled === 'boolean')
 
   console.log('\n=== 7. heartbeat: answer one server ping ===')
   const beat = await answerOnePing(wsResult.socket)
-  ok(beat.pinged ? 'server sent a ping' : 'no ping within the window', beat.detail)
+  check('server sent a ping within the window', beat.pinged, beat.detail)
 
   return report()
 }
@@ -196,7 +195,7 @@ async function answerOnePing(socket) {
 }
 
 function report() {
-  const failed = steps.filter(s => !s.pass).length
+  const failed = steps.filter(s => !s).length
   console.log(`\n${steps.length - failed} passed, ${failed} failed`)
   process.exit(failed === 0 ? 0 : 1)
 }

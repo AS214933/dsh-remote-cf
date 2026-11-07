@@ -11,24 +11,31 @@
  * This performs the one request the plugin skipped, using the Host identity already on
  * disk, and writes the result where the plugin expects to find it.
  *
- *   node fix-host-claim.mjs <server-url> <email> <password>
+ * OPERATOR REPAIR UTILITY, NOT AN AUTOMATED TEST. Re-registration replaces live
+ * Host credentials and can invalidate its old tokens. Stop the Host first.
  *
- * Safe to re-run: it reuses the existing Host identity, so the device id stays stable
- * and previously pinned peers keep working.
+ *   DSH_TEST_PASSWORD=<protected-value> node test/fix-host-claim.mjs <server-url> <email> --state-root <server-state-directory> [--apply]
+ *
+ * Without --apply this only checks paths. An explicit scoped state directory is
+ * mandatory; no home-profile discovery occurs. A backup is made before overwriting.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs'
-import { join } from 'node:path'
-import { createHash } from 'node:crypto'
-import { homedir } from 'node:os'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, copyFileSync, constants } from 'node:fs'
+import { join, resolve } from 'node:path'
 
-const [serverUrl, email, password] = process.argv.slice(2)
-if (!serverUrl || !email || !password) {
-  console.error('usage: node fix-host-claim.mjs <server-url> <email> <password>')
+const [serverUrl, email, ...flags] = process.argv.slice(2)
+const stateIndex = flags.indexOf('--state-root')
+const rootArg = stateIndex >= 0 ? flags[stateIndex + 1] : null
+const apply = flags.includes('--apply')
+const password = process.env.DSH_TEST_PASSWORD
+const validFlags = flags.filter((_, index) => index !== stateIndex && index !== stateIndex + 1)
+if (validFlags.some(flag => flag !== '--apply')) throw new Error('Unsupported repair flag')
+if (!serverUrl || !email || !rootArg || (apply && !password)) {
+  console.error('usage: node test/fix-host-claim.mjs <server-url> <email> --state-root <server-state-directory> [--apply]; apply requires DSH_TEST_PASSWORD')
   process.exit(2)
 }
-
-const scope = createHash('sha256').update(serverUrl).digest('hex').slice(0, 24)
-const root = join(homedir(), '.dsh', 'remote', 'servers', scope)
+const target = new URL(serverUrl)
+if (target.username || target.password || target.search || target.hash || target.pathname !== '/') throw new Error('server-url must be an origin')
+const root = resolve(rootArg)
 const hostDir = join(root, 'host')
 const hostDevicePath = join(hostDir, 'device.json')
 const hostCredPath = join(hostDir, 'server-credentials.json')
@@ -37,6 +44,16 @@ const readJson = p => (existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : nul
 
 console.log(`server : ${serverUrl}`)
 console.log(`state  : ${root}\n`)
+
+if (!apply) {
+  console.log('DRY RUN: no profile content read, no network or credential write. Stop Host and add --apply only for intentional repair.')
+  console.log(`identity exists: ${existsSync(hostDevicePath)}; credentials exist: ${existsSync(hostCredPath)}`)
+  process.exit(0)
+}
+if (existsSync(hostCredPath)) {
+  copyFileSync(hostCredPath, `${hostCredPath}.${Date.now()}.backup`, constants.COPYFILE_EXCL)
+  console.log('Existing credential file backed up locally; keep the backup private.')
+}
 
 const hostDevice = readJson(hostDevicePath)
 if (hostDevice === null) {
@@ -58,7 +75,7 @@ async function main() {
   })
   const loginBody = await login.json().catch(() => null)
   if (!login.ok || typeof loginBody?.token !== 'string') {
-    console.error(`login failed: ${login.status} ${JSON.stringify(loginBody)?.slice(0, 200)}`)
+    console.error(`login failed: ${login.status}`)
     process.exit(1)
   }
   console.log(`  ok, account=${loginBody.account}`)
@@ -101,7 +118,7 @@ async function main() {
     })
     const body = await registered.json().catch(() => null)
     if (!registered.ok) {
-      console.error(`  client registration failed: ${registered.status} ${JSON.stringify(body)?.slice(0, 200)}`)
+      console.error(`  client registration failed: ${registered.status}`)
       process.exit(1)
     }
     authorizingToken = body.accessToken
@@ -131,10 +148,10 @@ async function main() {
   })
   const tokens = await claim.json().catch(() => null)
   if (!claim.ok || typeof tokens?.accessToken !== 'string') {
-    console.error(`  claim failed: ${claim.status} ${JSON.stringify(tokens)?.slice(0, 300)}`)
+    console.error(`  claim failed: ${claim.status}`)
     process.exit(1)
   }
-  console.log(`  ok, access token issued (${String(tokens.accessToken).slice(0, 10)}…)`)
+  console.log('  ok, access token issued (value withheld)')
 
   console.log('\n=== 4. write the credential file the plugin reads ===')
   // Schema matches what `ServerCredentialStore` parses; a mismatch makes the plugin

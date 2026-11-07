@@ -2,8 +2,8 @@
   // Local development config. Safe to commit: every value is a throwaway used only
   // against a local `wrangler dev`, never against a deployed Worker.
   //
-  // Real deployments do not use this file. They set `DSH_SERVER_ACCOUNT` in
-  // wrangler.jsonc (or CI) and the two secrets with `wrangler secret put`.
+  // Real deployments use an ignored *.local.jsonc copy and Workers runtime secrets.
+  // No external OAuth fixture here: npm run test:oauth-runtime is fully isolated.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "dsh-remote-server",
   "main": "src/worker.ts",
@@ -20,8 +20,6 @@
   "vars": {
     "DSH_SERVER_ACCOUNT": "owner@example.com",
     "DSH_SERVER_PUBLIC_URL": "http://127.0.0.1:8790",
-    "OAUTH_PROVIDERS": "[{\"id\": \"mock\", \"displayName\": \"Mock IdP\", \"authorizeUrl\": \"http://127.0.0.1:8790/authorize\", \"tokenUrl\": \"http://127.0.0.1:8901/token\", \"userInfoUrl\": \"http://127.0.0.1:8901/user\", \"clientId\": \"mock-client\", \"scopes\": \"read:user user:email\", \"accountField\": \"email\", \"emailUrl\": \"http://127.0.0.1:8901/user/emails\", \"emailListField\": \"email\", \"emailPrimaryField\": \"primary\"}]",
-    "OAUTH_MOCK_CLIENT_SECRET": "mock-secret",
     // Both are local-only fixtures. `DSH_SERVER_PASSWORD` must still be at least 8
     // characters because the Worker refuses to start otherwise.
     "DSH_SERVER_PASSWORD": "local-dev-only",

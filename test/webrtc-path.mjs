@@ -1,3 +1,4 @@
+import { createManualChecks } from './manual-check.mjs'
 /**
  * WebRTC data channel through the server's signaling path.
  *
@@ -33,9 +34,7 @@ if (!REPO) {
 }
 const toUrl = p => `file://${p.replace(/\\/g, '/')}`
 
-const steps = []
-const ok = (n, d = '') => { steps.push(true); console.log(`  ok   ${n}${d ? ` — ${d}` : ''}`) }
-const fail = (n, d = '') => { steps.push(false); console.log(`  FAIL ${n}${d ? ` — ${d}` : ''}`) }
+const { steps, ok, fail, check } = createManualChecks()
 const skip = (n, d = '') => { console.log(`  skip ${n}${d ? ` — ${d}` : ''}`) }
 
 const { HostServerApi } = await import(toUrl(joinPath(REPO, 'packages/plugin/src/server-api.ts')))
@@ -122,7 +121,7 @@ async function main() {
   if (incoming === null) { fail('connect.incoming'); return report() }
   ok('host received connect.incoming', `transports=${JSON.stringify(incoming.payload.preferredTransports)}`)
   const negotiated = incoming.payload.preferredTransports
-  ok('p2p was negotiated', Array.isArray(negotiated) && negotiated.includes('p2p'))
+  check('p2p was negotiated', Array.isArray(negotiated) && negotiated.includes('p2p'))
 
   host.send('connect.accepted', { connectionId: incoming.payload.connectionId })
   const accepted = await take(client.frames, client.waiters, 'connect.accepted', 10_000)
@@ -233,8 +232,8 @@ async function main() {
   })
   channel.send(payload)
   const got = await received
-  ok(got === payload ? 'host received the payload over WebRTC' : 'payload did not arrive',
-    got === null ? 'timeout' : `${String(got).slice(0, 40)}`)
+  check('host received the payload over WebRTC', got === payload,
+    got === null ? 'timeout' : 'received data must match exactly')
 
   console.log('\n=== 5. report the selected path ===')
   const pair = pcClient.getStats === undefined ? null : await pcClient.getStats?.()
@@ -247,7 +246,8 @@ async function main() {
     }
   }
   const localCandidate = [...(pair?.values?.() ?? [])].find(r => r.type === 'local-candidate')
-  ok('ICE completed', `pair=${selected}, candidateType=${localCandidate?.candidateType ?? 'n/a'}`)
+  check('ICE completed', pcClient.iceConnectionState === 'connected' || pcClient.iceConnectionState === 'completed',
+    `state=${pcClient.iceConnectionState}, pair=${selected}, candidateType=${localCandidate?.candidateType ?? 'n/a'}`)
 
   // Tell the server which transport won, as the clients do.
   client.send('transport.selected', {
@@ -255,7 +255,7 @@ async function main() {
     transport: 'p2p',
   })
   const selectedFrame = await take(host.frames, host.waiters, 'transport.selected', 8_000)
-  ok(selectedFrame === null ? 'transport.selected was dropped' : 'transport.selected relayed',
+  check('transport.selected relayed unchanged', selectedFrame?.payload?.transport === 'p2p',
     selectedFrame === null ? 'host did not see it' : String(selectedFrame.payload.transport))
 
   try { pcClient.close(); pcHost.close(); client.socket.close(); host.socket.close() } catch { /* ignore */ }
